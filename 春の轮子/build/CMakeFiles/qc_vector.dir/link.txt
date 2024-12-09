@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/qc_vector.dir/qc_vector.cc.o -o qc_vector 

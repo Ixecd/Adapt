@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/qc_optional.dir/qc_optional.cc.o -o qc_optional 
