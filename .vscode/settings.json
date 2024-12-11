@@ -1,5 +1,6 @@
 {
     "files.associations": {
+        "*.dbclient-js": "javascript",
         "ostream": "cpp",
         "stdexcept": "cpp",
         "bitset": "cpp",
@@ -90,7 +91,8 @@
         "format": "cpp",
         "spanstream": "cpp",
         "stacktrace": "cpp",
-        "stdfloat": "cpp"
+        "stdfloat": "cpp",
+        "stack": "cpp"
     },
     "aide.convertLanguagePairs": {
         "javascript": "cpp",
