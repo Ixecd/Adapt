@@ -20,6 +20,6 @@ $ kubectl logs podName -c cName
 
 # 查看资源对象的详细描述 
 $ kubectl describe pod podName
-
-
 ```
+
+## 往github传镜像的时候,镜像太多缓存不够不能push成功,分批次push
