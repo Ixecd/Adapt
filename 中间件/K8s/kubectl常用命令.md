@@ -20,4 +20,6 @@ $ kubectl logs podName -c cName
 
 # 查看资源对象的详细描述 
 $ kubectl describe pod podName
+
+
 ```
