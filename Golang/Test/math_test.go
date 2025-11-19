@@ -305,3 +305,9 @@ func TestPrintHello(t *testing.T) {
 		})
 	}
 }
+
+func TestMain(m *testing.M) {
+    fmt.Println("do some setup")
+    m.Run()
+    fmt.Println("do some cleanup")
+}
