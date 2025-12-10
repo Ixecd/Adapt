@@ -1,4 +1,0 @@
-message HostInfo {
-    int32 ip = 1;
-    int32 port = 2;
-}
