@@ -63,6 +63,10 @@ type data struct {
 	s string
 }
 
+func exec(f func()) {
+	f()
+}
+
 func testData () {
 	// var a data = data{1, "abc"}
 	// a2 := data{1, "abc"}
@@ -99,4 +103,8 @@ func main() {
 	testFallthrough()
 
 	println(a == nil)
+
+	fmt.Println("=====================>")
+	var f func() = func() { println("hello,world!") }
+	exec(f)
 }
