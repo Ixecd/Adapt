@@ -1,0 +1,3 @@
+/home/qc/routine_test/CUDA/build/CMakeFiles/main.dir
+/home/qc/routine_test/CUDA/build/CMakeFiles/edit_cache.dir
+/home/qc/routine_test/CUDA/build/CMakeFiles/rebuild_cache.dir
