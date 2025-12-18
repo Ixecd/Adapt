@@ -102,5 +102,21 @@
         "jsonc": "cpp"
     },
     "cmake.configureOnOpen": false,
-    "C_Cpp.default.compilerPath": "/usr/bin/g++"
+    "C_Cpp.default.compilerPath": "/usr/bin/g++",
+    "explorer.confirmDelete": false,
+  "files.autoSave": "afterDelay",
+  "git.confirmSync": false,
+  "explorer.confirmDragAndDrop": false,
+  "editor.fontFamily": "'Fira Code'",
+  "editor.fontLigatures": true,
+  "editor.fontSize": 14,
+  "workbench.editorAssociations": {
+    "*.docx": "default"
+  },
+  "AI.toolcall.v2.command.allowList": "[\"textutil\",\"pdftotext\",\"strings\"]",
+  "editor.renderWhitespace": "all",
+  "editor.tabSize": 4,
+  "editor.insertSpaces": false,
+  "workbench.colorTheme": "Light",
+  "trae.tab.enableSmartEdit": false,
 }
