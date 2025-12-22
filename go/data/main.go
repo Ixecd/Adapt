@@ -54,4 +54,49 @@ func main() {
 	ap["a"]++
 
 	fmt.Println(ap)
+
+	type file struct {
+		name string
+		attr struct {
+			owner int
+			perm int
+		}
+	}
+
+	f := file{
+		name: "test.txt",
+		attr: struct {
+			owner int
+			perm int
+		}{
+			owner: 1000,
+			perm:  0644,
+		},
+	}
+
+	f.attr.owner = 1001
+	f.attr.perm = 0644
+
+	type user struct {
+		name string
+		age int
+	}	
+
+	o := &user{
+		name: "John",
+		age: 30,
+	}
+
+	o.name = "Mike"
+	o.age = 31
+
+	o2 := &o
+	(*o2).name = "Tom"
+	(*o2).age = 32
+
+	fmt.Println(o)
+	fmt.Println(*o2)
+
+	println("================================================")
+
 }
