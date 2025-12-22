@@ -119,4 +119,16 @@
   "editor.insertSpaces": false,
   "workbench.colorTheme": "Solarized Light",
   "trae.tab.enableSmartEdit": false,
+  "editor.formatOnSave": true,
+  "go.formatTool": "goimports",
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "golang.go"
+  },
+  "[go.mod]": {
+    "editor.formatOnSave": true,
+  },
+  "[go.sum]": {
+    "editor.formatOnSave": false,
+  }
 }
