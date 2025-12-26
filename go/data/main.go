@@ -99,4 +99,16 @@ func main() {
 
 	println("================================================")
 
+	nul := struct{}{}
+	users := make(map[int]struct{})
+
+	for i := 0; i < 100; i++ {
+		users[i] = nul
+	}
+
+	for k, _ := range users {
+		println(k)
+		break
+	}
+
 }
