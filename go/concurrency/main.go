@@ -23,7 +23,7 @@ func c() {
 	println("c")
 }
 
-func main() {
+func concurrencyTest() {
 	q := make(chan struct{})
 
 	go func() {
@@ -172,4 +172,29 @@ func main() {
 	}
 	swg.Wait()
 	fmt.Printf("%+v\n", gls)
+}
+
+func main() {
+	// sync
+	quit := make(chan struct{})
+	data := make(chan int)
+
+	go func() {
+		data <- 11
+	}()
+
+	go func() {
+		defer close(quit)
+
+		fmt.Printf("data: %d", <-data)
+		fmt.Printf("data: %d\n", <-data)
+	}()
+
+	data <- 22
+	<-quit
+	// 22 11 和 11 22 都有可能，只不过 11 22 很少很少
+	// 因为当前环境下调度几乎总是 main 先跑
+
+	println("===============>")
+	// async
 }
