@@ -151,4 +151,25 @@ func main() {
 	defer println("main done.")
 	// os.Exit 可在任意位置结束进程。不等待其他任务，也不执行延迟调用defer
 	// os.Exit(0)
+
+	println("===============>")
+	// go 中 所有 协程 共享同一个虚拟地址空间
+	var gls [2]struct{
+		id int
+		ret int
+	}
+
+	var swg sync.WaitGroup
+	swg.Add(len(gls))
+
+	for i := 0; i < len(gls); i++ {
+		go func(id int) {
+			defer swg.Done()
+
+			gls[id].id = id
+			gls[id].ret = (id + 1) * 100
+		}(i)
+	}
+	swg.Wait()
+	fmt.Printf("%+v\n", gls)
 }
