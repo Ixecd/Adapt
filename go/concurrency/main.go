@@ -1,12 +1,14 @@
 package main
 
 import (
-	_ "os"
+	"context"
 	"fmt"
+	_ "os"
+	"reflect"
+	"runtime"
 	"sync"
 	"time"
-	"context"
-	"runtime"
+	"unsafe"
 )
 
 
@@ -174,7 +176,7 @@ func concurrencyTest() {
 	fmt.Printf("%+v\n", gls)
 }
 
-func main() {
+func aysn() {
 	// sync
 	quit := make(chan struct{})
 	data := make(chan int)
@@ -195,6 +197,230 @@ func main() {
 	// 22 11 和 11 22 都有可能，只不过 11 22 很少很少
 	// 因为当前环境下调度几乎总是 main 先跑
 
+}
+// 为了避免重复关闭
+func closechan[T any](c chan T) {
+	defer func() {
+		recover()
+	}()
+	close(c)
+}
+
+func async() {
 	println("===============>")
 	// async
+	quit := make(chan struct{})
+	data := make(chan int, 3)
+
+	data <- 11
+	data <- 22
+	data <- 33
+
+	println(cap(data), len(data))
+
+	go func() {
+		defer close(quit)
+
+		println(<- data)
+		println(<- data)
+		println(<- data)
+		
+		println(<- data)
+	}()
+	// 缓冲区已满，阻塞
+	data <- 44
+	// 阻塞，直到 gorouine 执行defer
+	<- quit
+
+	var a, b chan int = make(chan int, 3), make(chan int)
+	var c chan bool
+
+	println(a == b)
+	println(c == nil)
+	println(a, unsafe.Sizeof(a))
+
+	closechan(a)
+	closechan(a)
+	closechan(b)
+	closechan(b)
 }
+
+type Queue[T any] struct {
+	sync.Mutex
+
+	ch chan T
+	cap int
+	closed bool
+}
+
+func NewQueue[T any](cap int) *Queue[T] {
+	return &Queue[T] {
+		ch: make(chan T, cap),
+	}
+}
+
+func (q *Queue[T]) Close() {
+	q.Lock()
+	defer q.Unlock()
+	if !q.closed {
+		close(q.ch)
+		q.closed = true
+	}
+}
+
+func (q *Queue[T]) IsClosed() bool {
+	q.Lock()
+	defer q.Unlock()
+	return q.closed
+}
+
+func queueTest() {
+	println("===============>")
+	var wg sync.WaitGroup
+	q := NewQueue[int](3)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			defer q.Close()
+			println(q.IsClosed())
+		}()
+	}
+	wg.Wait()
+
+	// 从 nil 通道接收 直接 panic
+	// chan receive (nil chan)
+	// <- (chan struct{})(nil)
+}
+
+func channelTest() {
+	println("===============>")
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	c := make(chan int)
+	var send chan<- int = c
+	var recv <-chan int = c
+
+	// recv
+	go func() {
+		defer wg.Done()
+		for x := range recv {
+			println(x)
+		}
+	}()
+
+	// send
+	go func() {
+		defer wg.Done()
+		defer close(c)
+		for i := 0; i < 3; i++ {
+			send <- i
+		}
+	}()
+
+	wg.Wait()
+
+
+	exit := make(chan struct{})
+
+	chans := make([]chan int, 0)
+	chans = append(chans, make(chan int))
+	chans = append(chans, make(chan int))
+
+	// select 语句是 编译时固定的
+	// 不能写成 select { case <- chans[i]: } i 是变量
+
+	go func() {
+		defer close(exit)
+		// reflect.Select 是 Go 反射包提供的动态select
+		// 处理运行时构建的case列表
+		// 普通 select 是编译时固定的，不能动态添加/删除case
+		// 这个 cases 数组子啊曾哥goroutine生命周期中只构建一次
+		cases := make([]reflect.SelectCase, len(chans))
+		for i, c := range chans {
+			cases[i] = reflect.SelectCase{
+				// 操作方向: 发送、接收、还是默认
+				Dir: reflect.SelectRecv,
+				// channel 的反射值,必须是channel类型
+				// 把普通的 channel值 c 类型转换成 反射值(reflect.Value类型)
+				// 该反射值内部持有对原channel的引用，不会复制channel
+				// 并且这个反射值会记住它是哪个具体的channel，后面即使将chans[i]改成别的值，
+				Chan: reflect.ValueOf(c),
+				// 如果是发送方向，这里放要发送的值
+				// Send: reflect.ValueOf(v)
+			}
+		}
+		// 上面等价于
+		// select {
+		//	case v, ok := <- chans[0]:
+		//
+		//	case v, ok := <- chans[1]:
+		//
+		//}
+		for {
+			// index 哪个case被选中
+			// value 接收到的值
+			// ok 是否成功接收
+			index, value, ok := reflect.Select(cases)
+			
+			if !ok {
+				// 这里 cases[index].Chan 依然指向原来的已关闭channel
+				// Golang中的 reflect.Select中 如果 case 的 Chan 是已关闭的正常channel->该case永远可能立即选中,返回 ok = false, value = 零值
+				// 如果是 nil channel -> 该 case 永不选中
+				chans[index] = nil
+				n := 0
+				for _, c := range chans {
+					if c == nil {
+						n++
+					}
+					if n == len(chans) {
+						return
+					}
+					continue
+				}
+			}
+			println(index, value.Int(), ok)
+		}
+	}()
+
+	chans[0] <- 1
+	chans[1] <- 2
+
+	for _, c := range chans {
+		// 已关闭的channel 总是 "就绪"
+		close(c)
+	}
+
+	<-exit
+}
+
+func newRecv[T any](cap int) (data chan T, done chan struct{}) {
+	data = make(chan T, cap)
+	done = make(chan struct{})
+
+	go func() {
+		defer close(done)
+		// 不断从data接收值，直到data被关闭
+		for v := range data {
+			println(v)
+		}
+	}()
+	return data, done
+}
+
+func main() {
+	println("===============>")
+	
+	data, done := newRecv[int](3)
+
+	for i := 0; i < 10; i++ {
+		data <- i
+	}
+
+	close(data)
+	<-done
+}
+
