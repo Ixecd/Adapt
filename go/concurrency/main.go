@@ -411,7 +411,7 @@ func newRecv[T any](cap int) (data chan T, done chan struct{}) {
 	return data, done
 }
 
-func main() {
+func recvTest() {
 	println("===============>")
 	
 	data, done := newRecv[int](3)
@@ -422,5 +422,22 @@ func main() {
 
 	close(data)
 	<-done
+}
+
+func main() {
+	var once sync.Once
+
+	f1 := func() {
+		println("f1")
+	}
+	
+	f2 := func() {
+		println("f2")
+	}
+
+	once.Do(f1)
+	once.Do(f1)
+	once.Do(f2)
+	once.Do(f2)
 }
 
