@@ -1,1 +1,10 @@
 .DS_Store
+
+*.etcd/
+member/
+data.etcd/
+
+*.wal
+*.snap
+
+*.log
