@@ -60,3 +60,50 @@ iptables -t nat -A POSTROUTING -d 192.168.1.0/24 -j MASQUERADE
 ```bash
 iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
 ```
+
+### 四、延迟与性能测试
+1. 延迟测试（公司网络 + ZeroTier虚拟网卡）
+- 测试工具: `ping`
+- 测试命令: `ping -c 10 -s 1200 10.70.61.xx`
+- 测试结果:
+```bash
+PING 10.70.61.xx (10.70.61.xx): 56 data bytes
+1208 bytes from 10.70.61.xx: icmp_seq=1 ttl=64 time=23.266 ms
+1208 bytes from 10.70.61.xx: icmp_seq=2 ttl=64 time=16.036 ms
+1208 bytes from 10.70.61.xx: icmp_seq=3 ttl=64 time=11.605 ms
+1208 bytes from 10.70.61.xx: icmp_seq=4 ttl=64 time=14.245 ms
+1208 bytes from 10.70.61.xx: icmp_seq=5 ttl=64 time=11.085 ms
+1208 bytes from 10.70.61.xx: icmp_seq=6 ttl=64 time=14.526 ms
+1208 bytes from 10.70.61.xx: icmp_seq=7 ttl=64 time=13.822 ms
+1208 bytes from 10.70.61.xx: icmp_seq=8 ttl=64 time=14.409 ms
+1208 bytes from 10.70.61.xx: icmp_seq=9 ttl=64 time=20.194 ms
+```
+2. !!延迟测试（公司网络 + QuickConnect）
+- 测试工具: `ping`
+- 测试命令: `ping -c 10 -s quickconnect.cn`
+- 测试结果: 不是实际的延迟
+```bash
+PING (28.0.0.37): 1200 data bytes
+1208 bytes from 28.0.0.37: icmp_seq=0 ttl=64 time=0.538 ms
+1208 bytes from 28.0.0.37: icmp_seq=1 ttl=64 time=0.359 ms
+1208 bytes from 28.0.0.37: icmp_seq=2 ttl=64 time=0.394 ms
+1208 bytes from 28.0.0.37: icmp_seq=3 ttl=64 time=0.356 ms
+1208 bytes from 28.0.0.37: icmp_seq=4 ttl=64 time=0.325 ms
+1208 bytes from 28.0.0.37: icmp_seq=5 ttl=64 time=0.385 ms
+1208 bytes from 28.0.0.37: icmp_seq=6 ttl=64 time=0.343 ms
+1208 bytes from 28.0.0.37: icmp_seq=7 ttl=64 time=0.447 ms
+```
+**PING值欺骗: 为什么Ping只有0.2ms，但是网页加载却要2秒？**
+
+实际再通过浏览器测试发现，QuickConnect打开网页的速度明显要比ZeroTier慢，但是延迟却比ZeroTier低。
+
+- 原因: 电脑上安装了 Synology Drive或者相关软件。这些软件会在本地运行一个「监听器」，ping quickconnect 时，电脑DNS会劫持这个请求，指向本地的一个虚拟地址(28.0.0.37)
+
+### 五、ZeroTier + HTTP 的安全性分析
+1. ZeroTier 本身提供强加密：ZeroTier 是基于 UDP 的虚拟网络层（Layer 2/3）隧道，使用 256-bit Salsa20 加密 + Poly1305 认证（类似 WireGuard 的安全级别）。所有在 ZeroTier 网络内的流量（包括 HTTP）都是端到端加密的，只有加入同一网络的授权节点才能解密。
+
+2. 在隧道内，HTTP 流量不会明文暴露：外部攻击者（比如公网嗅探、ISP）无法看到您的用户名、密码或文件内容，因为整个数据包都在加密隧道里传输。这比直接公网暴露 HTTP 要安全得多。
+
+3. 实际风险很低：在家庭/个人场景下，如果您的 ZeroTier 网络只授权了可信设备（手机、电脑），且节点没有被恶意软件感染，HTTP 就已经足够安全。很多用户长期这样用，没有出过问题。
+
+4. 推荐再加一层HTTPS，安全更加彻底，几乎无成本（买个域名，从Let's Encrypt申请免费证书）
