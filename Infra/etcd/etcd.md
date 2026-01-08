@@ -163,4 +163,66 @@ type keyIndex struct {
 	modified 		revision	// 用户key最近一次修改的全局版本号，即mod_revision
 	generations		[]generation// 用户key的多个版本号，即所有create_revision
 }
+type generation struct {
+	version			int64		// 表示此key的修改次数
+	created			revision	// 表示generation结构创建时的版本号
+	revs			[]revision	// 每次修改key时的revision追加到此数组
+}
+type revision struct {
+	main			int64		// 全局递增的主版本号，随put/txn/delete事务递增，一个事务内的key main版本号是一致的
+	sub				int64		// 一个事务内的子版本号，从0开始随事务内put/delete操作递增
+}
 ```
+generation结构体中包含此key的修改次数、generation创建时的版本号、对此key的修改版本号记录列表
+
+revision包含main和sub两个字段，main是全局递增的版本号，它是etcd逻辑时钟，随着put/txn/delete等事务递增。sub是一个事务内的子版本号，从0开始随事务内的put/delete操作递增
+
+### MVCC更新key原理
+
+在put写事务中，先从treeIndex查key的keyIndex索引信息，keyIndex中存储了key的创建版本号、修改的次数等信息，这些信息在事务中发挥着重要作用，会存储在boltdb的value中
+
+1. 获取key的keyIndex信息(包含Ver，CreatedVer信息)
+2. key:revision{txid, 0}, Value: KeyValue写入新的key-value到boltdb和buffer中
+3. 创建/更新keyIndex，更新keyIndex到treeIndex
+4. backend异步事务提交goroutine
+
+boltdb的value是**mvccpb.KeyValue**结构体，它是由 key、value、 create_revision、 mod_revision、 lease组成。填充好boltdb的KeyValue结构体后，这时就可以通过Backend的写事务batchTx接口将 key{revision, 0}, value为 mvccpb.KeyValue 保存到boltdb的缓存中，并同步更新buffer
+
+此时存储到boltdb中的key、value数据如下
+
+```
+	command						boltdb key				boltdb value/mvccpb.KeyValue
+etcdctl put hello world1		key{2, 0}			value{key: base64(hello), value: base64(world1), create_revision: 1, mod_revision: 1, lease: 0}
+```
+
+**Version** 和 **ModRevision**
+- **Version** 指的是修改的次数
+- **ModRevision** 指的是根据revision(全局)来设定的
+
+此时数据还未持久化，为了提升etcd的写吞吐量、性能，一般情况下（默认堆积的写事务数大于1万才在写事务结束时同步持久化），数据持久化由Backend的异步goroutine完成，通过事务批量提交，定时将boltdb页缓存中的脏数据提交到持久化存储磁盘中
+
+### MVCC查询key原理
+完成put hello为world操作后，这时需要通过etcdctl发起一个get hello操作，MVCC模块首先会创建一个读实物对象(TxnRead)，在etcd 3.4中Backend实现了ConcurrentReadTx，并发读特性
+
+并发读特性的核心原理是创建读事务对象时，会全量拷贝当前写事务未提交的buffer数据，并发的读写事务不再阻塞在一个buffer资源锁上，实现了全并发读
+
+先去treeIndex找key(keyIndex对象,匹配有效的generation,获取的是key{mod_revision, 0})，之后去buffer里找，未命中就去boltdb里找
+
+指定版本号读取历史记录的实现方法: 如果后续再通过 put hello worldx 修改操作时，key hello对应的keyIndex结果如下所示， keyIndex.modified字段更新为<3,0>，generation的revision数组追加最新的版本号<3, 0>，ver修改为2。boltdb会插入一个新的key revision{3, 0}，指定版本号之后treeIndex模块会遍历generation内的历史版本号，返回小于等于mod_revision最大历史版本号
+
+### MVCC删除key原理
+etcd实现的是标记延期删除模式，原理与key更新类似
+
+生成的boltdb key版本号为 key{x, 0, t}追加了删除标识(tombstone,简写t)，boltdb value变成只含用户key的KeyValue结构体。treeIndex模块也会给此key hello对应的keyIndex对象添加一个generation结构体，表示此索引对应的key被删除了
+
+etcdctl delete hello 操作后的keyIndex结果如下面所示
+
+![delete hello keyIndex](./images/revision_5.png)
+
+boltdb 中的 key-value 数据如下图所示
+
+![boltdb](./images/revision_6.png)
+
+删除key时会生成events，Watch模块根据key的删除标识，会生成对应的Delete事件。重启etcd，遍历boltdb中的key构建treeIndex内存树时，需要知道哪些key是已经被删除的，并为对应的key索引生成tombstone标识
+
+真正删除treeIndex中的索引对象、boltdb中的key是通过(compactor)组件异步完成
