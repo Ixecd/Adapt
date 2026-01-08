@@ -90,6 +90,7 @@ func TestA(t *testing.T) {
 可用来写`Helper`函数，意思就是**谁申请，谁负责定义销毁规则**
 ```go
 func newDatabase(t *testing.T) *DataBase{
+	// 这里面如果报错的话，显示的是外层函数的行号
 	t.Helper()
 
 	d := Database.Open()
