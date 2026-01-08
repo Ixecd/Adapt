@@ -97,3 +97,70 @@ etcdctl user grant-role alice admin --user root:root
 
 有可能一个用户拥有成百上千个权限列表，etcd为了提升权限检查的性能，引入了区间树，检查用户操作的key是否在已经授权的区间，时间复杂度仅为 O(logN)
 
+### Lease
+etcd默认的Lease最小值是1s
+
+### MVCC
+从名字上理解，它是一个基于多版本技术实现的一种并发控制机制
+
+常见的并发控制机制有 悲观锁、读写锁、互斥锁、两阶段锁等
+
+**MVCC机制是基于多版本技术实现的一种乐观锁机制**
+
+在MVCC数据库中，更新一个key-value数据的时候，不会去覆盖原来的数据，而是新增一个版本来存储新的数据，每个数据都有一个版本号，删除数据的时候，实际上也是新增一条带删除标识的数据记录
+
+修改前的详细信息
+![修改前的详细信息](./images/revision_1.png)
+
+修改后的详细信息
+![修改后的详细信息](./images/revision_2.png)
+
+对比修改前后，可以发现：
+- 修改后 revision + 1
+- kvs中的 mod_vision 和 version 都 + 1， 这里 key 和 value 都经过了 base64 处理
+
+`etcdctl get hello --rev=2 --endpoints=http://127.0.0.1:2379 --user root:root -w json | jq`
+
+![get hello --rev=2](./images/revision_3.png)
+
+对上面的信息需要进行一些解释，`header` 中的 `revision` 反映的「现在」，而 `kvs` 中的 `revision` 反映的是「过去」
+
+- `create_revision` 表示这个key是在全局版本号为2的时候被创建的
+- `mod_revision` 表示这个key最近一次被修改，是在全局版本号为2的时候
+
+`--rev`这个选项既不是专门「创建版本」也不是找「修改版本」，而是找**快照版本**，本质上就是 <= mod_revision最大的那个
+
+删除这个key之后，依然可以根据revision来找到相应的value，除非etcd执行了**压缩(Compaction)**操作时，带有旧Value的历史版本会真正从磁盘上被物理清理掉
+
+![delete Hello](./images/revision_4.png)
+
+
+### 整体架构
+整个MVCC特性由treeIndex、boltdb组层
+
+Apply模块通过MVCC模块来执行put请求，持久化key-value数据。MVCC模块将请求划分为两个类别，分别是读事务(ReadTxn)和写事务(WriteTxn)。读事务负责处理range请求，写事务负责put/delete请求。读写事务基于treeIndex、Backend(boltdb)提供的能力实现对key-value的增删改查功能
+
+treeIndex模块基于内存版的 B-tree实现key索引管理，其保存了用户key与版本号(所有mod_revision)的映射关系等信息。不添加`--rev`选项时，treeIndex模块会根据用户输入的key，在内存中查找对应的版本号(最新的mod_revision)，然后根据版本号去Backend模块中查找对应的value
+
+Backend模块负责etcd的key-value持久化存储，主要由ReadTx、BatchTx、Buffer组成，ReadTx定义了抽象的读事务接口，BatchTx在ReadTx之上定义了抽象的写事务接口，Buffer是数据缓冲区
+
+etcd设计上支持多种Backend实现，目前实现的Backend是boltdb，其是一个基于B+tree实现的、支持事务的key-value嵌入式数据库
+
+### treeIndex原理
+treeIndex出现的原因就是v2版本的etcd直接会将新的value覆盖旧的value，无法支持保存key的历史版本，其可以提供稳定的Watch机制和实物隔离等能力
+
+功能上，etcd支持范围查询，因此保存索引的数据结构也必须支持范围查询，哈希表不适合，B-tree支持范围查询
+
+性能上，平衡二叉树内个节点只能容纳一个数据、树的高度比较高，B-tree每个节点可以容纳多个数据，树的高度更低、更扁平，涉及的查找次数更少，具有优越的增删改查性能
+
+在一个**度**为 **d** 的B-tree中，节点保存的最大key数量为 **2d - 1**，最多的子节点数量是 **2d**，etcd treeIndex模块中，创建的最大度是32，也就是说内部节点最多可以保存63个key，最多可以有64个子节点
+
+在TreeIndex中，每个节点的key是一个keyIndex结构，etcd就是通过它保存了用户 key 与 版本号的映射关系
+
+```go
+type keyIndex struct {
+	key				[]byte		// 用户key名称
+	modified 		revision	// 用户key最近一次修改的全局版本号，即mod_revision
+	generations		[]generation// 用户key的多个版本号，即所有create_revision
+}
+```
