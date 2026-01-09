@@ -1,6 +1,6 @@
 ## etcd 记录
 
-### 认证与授权
+## 认证与授权
 - 添加用户 root `etcdctl user add root:root`
 - 给予root用户root权限(必须) `etcdctl user grant-role root root`
 - 开启认证 `etcdctl auth enable`
@@ -72,7 +72,7 @@ openssl x509 -noout -text -in client.pem
 
 性能上，证书认证不需要像密码认证一样调用昂贵的密码认证操作
 
-### 授权
+## 授权
 
 开启鉴权之后，put请求命令在应用到状态机前，etcd还会发出对此请求的用户进行权限检查，判断其是否有权限操作请求的数据。
 
@@ -97,10 +97,10 @@ etcdctl user grant-role alice admin --user root:root
 
 有可能一个用户拥有成百上千个权限列表，etcd为了提升权限检查的性能，引入了区间树，检查用户操作的key是否在已经授权的区间，时间复杂度仅为 O(logN)
 
-### Lease
+## Lease
 etcd默认的Lease最小值是1s
 
-### MVCC
+## MVCC
 从名字上理解，它是一个基于多版本技术实现的一种并发控制机制
 
 常见的并发控制机制有 悲观锁、读写锁、互斥锁、两阶段锁等
@@ -226,3 +226,67 @@ boltdb 中的 key-value 数据如下图所示
 删除key时会生成events，Watch模块根据key的删除标识，会生成对应的Delete事件。重启etcd，遍历boltdb中的key构建treeIndex内存树时，需要知道哪些key是已经被删除的，并为对应的key索引生成tombstone标识
 
 真正删除treeIndex中的索引对象、boltdb中的key是通过(compactor)组件异步完成
+
+## Watch机制
+高效获取数据变化通知
+
+etcd的Watch特性是Kubernetes控制器的工作基础
+
+![watch机制](./images/watch_1.png)
+
+1. client获取事件的机制，etcd是使用轮训模式还是推送模式呢？两者各有什么优缺点？
+
+2. 事件是如何存储的？会保留多长时间？watch命令中的版本号具体有什么作用呢？
+
+3. 当client和server端出现短暂网络波动等异常因素后，导致事件堆积时，etcd是如何根据变化的key快速找到监听它的watcher呢？
+
+4. 如果创建了上万个watcher监听key变化，当server端收到一个写请求后，etcd是如何根据变化的key快速找到监听它的watcher呢？
+
+### 轮训 & 流式推送
+这两种机制etcd都有使用
+
+etcd v3中，使用基于HTTP/2的gRPC协议，双向流的Watch API设计，实现了连接多路复用
+
+在HTTP/2协议中，HTTP消息会被分解成独立的帧(Frame)，交错发送，帧是最小的数据单位。每个帧会标识属于哪个流(Stream)，留由多个数据帧组成，每个流拥有一个唯一的ID，这个数据流对应一个请求或响应包。HTTP/2可基于帧的流ID将并行、交错发送的帧重新组装成完整的消息。
+
+基于HTTP/2的多路复用机制，实现一个client/TCP连接支持多gRPC Stream，一个gRPC Stream又支持多个watcher。事件通知模式从v2的client轮训优化成server流式推送，极大降低了server端socket、内存等资源
+
+在clientv3库中，Watch特性被被抽象成Watch、Close、RequeestProgress三个简单API提供给开发者使用，屏蔽了client与gRPC WatchServer交互的复杂细节，实现了一个client支持多个gRPC Stream，一个gRPC Stream支持多个watcher，显著降低了开发复杂度
+
+当watch连接的节点故障，clientv3库支持自动重连到健康节点，并使用之前已接收的最大版本号创建新的watcher，避免旧事件回放等
+
+### 滑动窗口 & MVCC
+上面问题2的本质是**历史版本存储**，etcd经历了从 滑动窗口 到 MVCC 机制的演变
+
+etcd v2是使用一个简单的环形数组来存储历史事件版本，当key被修改后，相关事件就会被添加到数组中来。若超过eventQueue的容量，则淘汰最旧的事件。v2中eventQueue的容量固定是1000，不会占用大量内存导致OOM
+```go
+type EventHistory struct {
+	Queue			eventQueue
+	StartIndex		uint64
+	LastIndex		uint64
+	Rev				sync.RWMutex
+}
+```
+其缺陷是显而易见的，固定的事件窗口只能保存有线的历史事件版本，是不可靠的。当写请求较多的时候、client与server网络出现波动等异常时，很容易导致事件丢失，client不得不触发大量的expensive查询操作，以获取最新的数据以及版本号，才能持续监听数据
+
+对于重度依赖Watch机制的Kubernetes而言，无法接受，因为会导致控制器等组件频繁的发起expensive List Pod等资源操作，导致APIServer/etcd出现高负载、OOM等，对稳定性会造成严重影响
+
+MVCC机制就是为了解决v2 watch机制不可靠诞生的。v3将一个key的历史修改版本保存在boltdb里面。boltdb是一个基于磁盘文件的持久化存储，不会丢失数据
+
+revision是etcd的逻辑时钟，当client因为网络等异常出现连接闪断后，通过revison就可以从server端的boltdb中获取错过的历史事件，而无需全量同步，其是etcd watch机制数据增量同步的核心
+
+### 可靠的事件推送机制
+
+当通过etcdctl或API发起一个watch key请求的时候，etcd的gRPCWatchServer收到watch请求后，会创建一个serverWatchStream，它负责接收client的gRPC Stream的create/cancel watcher请求(recvLoop goroutine)，并将从MVCC模块接收到的Watch时间转发给client(sendLoop goroutine)
+
+当serverWatchStream收到create watcher请求后，serverWatchstream会调用MVCC模块的WatchStream子模块分配一个watcher id，并将watcher注册到MVCC的WatchableKV模块
+
+在etcd启动时，watchableKV模块会运行syncWatchersLoop和syncVictimsLoop goroutine，分别负责不同场景下的事件推送
+
+etcd在面对各类异常，实现可靠事件推送的机制是 **复杂度管理，问题拆分**
+
+etcd根据不同场景，对问题进行了分解，将watcher按场景分类，实现了轻重分离、低耦合
+
+**synced watcher** 表示此类watcher监听的数据都已经同步完成，在等待新的变更
+
+
