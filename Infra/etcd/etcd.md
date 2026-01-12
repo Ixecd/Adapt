@@ -242,8 +242,8 @@ etcd的Watch特性是Kubernetes控制器的工作基础
 
 4. 如果创建了上万个watcher监听key变化，当server端收到一个写请求后，etcd是如何根据变化的key快速找到监听它的watcher呢？
 
-### 轮训 & 流式推送
-这两种机制etcd都有使用
+### 轮询 & 流式推送
+轮询v2，流式推送v3
 
 etcd v3中，使用基于HTTP/2的gRPC协议，双向流的Watch API设计，实现了连接多路复用
 
@@ -288,5 +288,88 @@ etcd在面对各类异常，实现可靠事件推送的机制是 **复杂度管�
 etcd根据不同场景，对问题进行了分解，将watcher按场景分类，实现了轻重分离、低耦合
 
 **synced watcher** 表示此类watcher监听的数据都已经同步完成，在等待新的变更
+
+**unsynced watcher** 表示此类watcher监听的数据还未同步完成，落后于当前最新数据变更，正在追赶
+
+### 最新时间推送机制
+当etcd收到一个写请求，key-value发生变化时，处于syncedGroup中的watcher，是如何获取到最新变化事件并推送给client的呢？
+
+当创建完成watcher后，执行put hello修改操作时，请求会经过 KVServer、Raft模块后Apply到状态机时，在MVCC的put事务中，它会将本次修改后的mvccpb.KeyValue保存到一个changes数组中，put事务结束的时候，会将KeyValue转换成Event事件，回调watchableStore.notify函数，notify会匹配出监听此key并处于synced watcherGroup中的watcher，同时事件中的版本号要大于等于watcher监听的最小版本号，才能将事件发送到此watcher，watcherStream.notify会把event打包成WatchResponse，最终push到watcherStream的sendCh channel中，serverWatchStream的sendLoop goroutine监听到channel消息后，读出消息立即推送给client。至此，完成一个最新修改事件推送
+
+etcd MVCC层用于构建watch事件的核心逻辑如下
+```go
+// changes 是一组内部表示的KeyValue变化记录
+// evs 是最终要提供给 watch 客户端的事件数组
+evs := make([]mvccpb.Event, len(changes))
+// 循环，将每个 changes[i] 转换成 evs[i]
+for i, change := range changes {
+	// 将 KeyValue 放入 event 中
+	evs[i].Kv = &changes[i]
+	// 核心逻辑，如果 CreateRevision 为0，则视为删除
+	if change.CreateRevision == 0 {
+		evs[i].Type = mvccpb.DELETE
+		// 不会真正删除，还要写条数据，revison改成当前 rev
+		evs[i].Kv.ModRevision = rev
+	} else { // 不是 DELETE 就是 PUT（合并创建与修改）
+		evs[i].Type = mvccpb.PUT
+	}
+}
+// 向 watcher 推送事件
+// tw 是 wathcer 对象（订阅者） （非 gRPC watcher，是内部watch触发器的 watcher）， .s 是 watcher 持有的 store 对象，类型是 *watchableStore， notify是 watchableStore 的方法
+tw.s.notify(rev, evs)
+```
+
+watch事件channel的buffer容量默认是1024，buffer满了事件会丢失吗？
+
+### 异常场景重试机制
+如果出现channel buffer满了，etcd为了保证Watch事件的高可靠性，并不会丢弃它，而是将此watcher从synced watcherGroup中删除，然后将此watcher和事件列表保存到一个名为受害者victim的watcherBatch结构中，通过**异步机制重试**保证事件的可靠性，notify操作它是在修改事务结束时同步调用的，必须是轻量级、高性能、无阻塞的，负责会严重影响集群写性能
+
+WatchableKV模块会启动两个异步goroutine，其中一个是syncVictimsLoop，正是它负责slower watcher的堆积的事件推送
+
+其工作原理就是，遍历victim watcherBatch数据结构，尝试将堆积的事件再次推送到watcher的接收channel中。如果推送失败，则再加入到victim watcherBatch数据结构中等待下次重试
+
+如果推送成功，watcher监听的最小版本号(minRev)小于等于server当前版本号(currentRev)，说明可能还有历史事件未推送，需加入到unsynced watcherGroup中，由历史事件推送机制，推送minRev到currentRev之间的事件
+
+如果watcher的最小版本号大于server当前版本号，则加入到synced watcher集合中，进入最新事件通知机制
+
+### 历史事件推送机制
+WatchableKV模块的另外一个goroutine，syncWatchersLoop，正是负责unsynced watcherGroup中的watcher历史事件推送
+
+syncWatchersLoop，会遍历处于unsynced watcherGroup中的每个watcher，为了优化性能，它会选择一批unsynced watcher批量同步，找出这一批unsynced watcher中监听的最小版本号
+
+boltdb的key是按照版本号存储的，可以通过指定查询的key范围的最小版本号作为开始区间，当前server最大版本号作为结束区间，遍历boltdb获得所有历史数据
+
+将KeyValue结构转换成事件，匹配出监听过事件中key的watcher后，将事件发送给对应的watcher事件接收channel即可。发送完成之后，watcher从unsynced watcherGroup中移除、添加到synced watcherGroup中
+
+如果watcher监听的版本号已经小于当前etcd server压缩的版本号，历史变更数据就可能已经丢失，因此etcd server会返回ErrCompacted错误给client（想看的部分旧历史没有了，重新先使用GET获取当前最新的revision，再watch）
+
+### 高效的事件匹配
+一个个遍历watcher是最简单的方法，但性能较差，在watcher数量较多的场景下，会导致性能出现瓶颈。更何况etcd是在执行一个写事务结束时，同步触发事件通知流程的，若匹配watcher开销较大，将严重印象etcd性能
+
+etcd使用map记录监听单个key的watcher，但是watch特性不仅仅是可以监听单key，它还可以指定监听key范围、key前缀，因此etcd还使用了如下区间数
+![事件匹配区间树](./images/watch_2.png)
+
+key空间被简化成了字母 a - z（实际上etcd的key是[]byte，按字典序比较，空间无限大，但是原理一样）
+- 每个节点包含三个东西
+	- 一个区间 `[low, high)`
+	- 一个watcherSet: 所有精准监听这个区间的客户端的watcher集合
+- 树是层次分割的
+	- 根节点覆盖**最大可能范围**
+	- 子节点范围是父节点的**严格子集**，并且子节点区间**互不重叠**，他们的并集等于父节点区间
+	- 分割方式类似二分
+- 这是一种**动态段树思想在区间上的实现**，或者叫**中心点区间树**。树会保持大致平衡（高度O(LogU)， U 是key的 宇宙大小（key可能取值的全集范围），或实际端点数）
+
+当收到创建watcher请求的时候，会把watcher监听的key范围插入到上面的区间树中，区间的值保存了监听同样key范围的watcher集合/watcherSet
+
+当产生一个事件时，etcd首先需要从map查找是否有watcher监听了单个key，其次还需要从区间树找出与此key相交的所有区间，然后从区间的值获取监听的watcher集合
+
+区间树支持快速查找一个key是否在某个区间内，时间复杂度为O(LogN)，因此etcd基于map和区间数实现了watcher与事件快速匹配，具备良好的扩展性
+
+其实上面的美好设计，并内有真正被采纳（etcd从v3到现在并没有使用区间树来管理范围watcher）
+
+实际上etcd的notify中使用了for range来遍历synced watcher（synced watcher数量通常几十到几百，k8s一个etcd实例服务多个namespace，但总watcher可控）
+
+如果 watcher 爆炸，那么官方推荐：使用多个etcd集群隔离、客户端聚合watcher、避免宽范围前缀
+
 
 
