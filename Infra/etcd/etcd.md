@@ -119,6 +119,10 @@ etcd默认的Lease最小值是1s
 - 修改后 revision + 1
 - kvs中的 mod_vision 和 version 都 + 1， 这里 key 和 value 都经过了 base64 处理
 
+**示例**
+
+如果不指定endpoints，其默认值就是 http://127.0.0.1:2379，其参数顺序也是有要求的，global flags **必须要放在子命令前面**，下面命令能正常执行，是因为 etcdctl 基于Cobra库，全局选项**理论上**必须放在子命令（get/put/txn）之前，但在get/put/del等简单子命令中，Cobra解释器对persistent flags有一定「宽容度」
+
 `etcdctl get hello --rev=2 --endpoints=http://127.0.0.1:2379 --user root:root -w json | jq`
 
 ![get hello --rev=2](./images/revision_3.png)
@@ -134,6 +138,13 @@ etcd默认的Lease最小值是1s
 
 ![delete Hello](./images/revision_4.png)
 
+强烈推荐使用环境变量彻底摆脱顺序烦恼
+```zsh
+export ETCDCTL_ENDPOINTS=http://127.0.0.1:2379
+export ETCDCTL_USER=root
+export ETCDCTL_PASSWORD=root
+etcdctl get hello --rev=2 -w json | jq
+```
 
 ### 整体架构
 整个MVCC特性由treeIndex、boltdb组层
@@ -346,7 +357,7 @@ boltdb的key是按照版本号存储的，可以通过指定查询的key范围�
 ### 高效的事件匹配
 一个个遍历watcher是最简单的方法，但性能较差，在watcher数量较多的场景下，会导致性能出现瓶颈。更何况etcd是在执行一个写事务结束时，同步触发事件通知流程的，若匹配watcher开销较大，将严重印象etcd性能
 
-etcd使用map记录监听单个key的watcher，但是watch特性不仅仅是可以监听单key，它还可以指定监听key范围、key前缀，因此etcd还使用了如下区间数
+~~etcd使用map记录监听单个key的watcher，但是watch特性不仅仅是可以监听单key，它还可以指定监听key范围、key前缀，因此etcd还使用了如下区间数~~
 ![事件匹配区间树](./images/watch_2.png)
 
 key空间被简化成了字母 a - z（实际上etcd的key是[]byte，按字典序比较，空间无限大，但是原理一样）
@@ -446,3 +457,249 @@ MVCC写事务完成转账，server返回给client转账成功后，boltdb的事�
 指在事务刚开始的时候，首先获取etcd当前的版本号rev，事务中后续发出的读请求都带上这个版本号rev，告诉etcd你需要获取那个时间点的快照数据，etcd的MVCC机制就能确保事务中能读取到同一时刻的数据
 
 同时，它还要确保事务提交时，读写的数据都是最新的，未被其他人修改，业绩就是要增加冲突检测机制（MVCC的版本号），事务提交出现冲突的时候依赖client重试解决，安全的实现多key原子更新
+
+![串行化快照隔离](./images/txn_4.png)
+
+事务A，Alice往Bob转账100，事务B，Mike向Bob转账100，两个事务同时发起转账操作
+
+一开始，Mike版本号（mod_revision）是4，Bob版本号是3，Alice版本号是2，资产各自200。为了防止并发写事务冲突，etcd在一个写事务开始时，会独占一个MVCC读写锁
+
+事务A和B会先去etcd查询当前Alice和Bob的资产版本号，用于在事务提交时做冲突检测。在事务A和B查询后，事务B加入先获得MVCC写锁并完成转账事务，Mike和Bob账号资产分别为100,300，版本号都是5（图里是5，我这里是12）
+
+事务B完成后，事务A获得写锁，开始执行事务
+
+事务A，期望的Alice版本号应该为2，Bob为3，但是实际上是5，那就重新获取Alice和Bob的资产版本号，再次执行事务，直到成功为止
+
+![eg](./images/txn_5.png)
+
+输出不够美观，搞个终端函数
+
+```zsh
+etcdtxn() {
+  local raw
+  raw=$(etcdctl txn -i -w json 2>&1)
+
+  # 提取最后以 { 开头的纯 JSON 行（忽略所有提示文本）
+  local json
+  json=$(echo "$raw" | grep -E '^\{' | tail -n 1)
+
+  if [ -n "$json" ]; then
+    echo "$json" | jq -r '
+      "Succeeded: \(.succeeded)",
+      "Revision: \(.header.revision)",
+      if .succeeded then
+        if (.responses | length) > 0 then
+          .responses[]
+          | .Response.ResponseRange.kvs // empty
+          | .[]
+          | "\(.key | @base64d): \(.value | @base64d) (mod: \(.mod_revision), ver: \(.version))"
+        else
+          "No results in success branch (e.g., only put/del)"
+        end
+      else
+        "Transaction failed (check compares)"
+      end
+    '
+  else
+    # 万一没提取到 JSON，直接显示原始输出（极少发生）
+    echo "=== No JSON detected (possible error) ==="
+    echo "$raw"
+    echo "=== end raw ==="
+  fi
+}
+```
+美化后的效果图
+![eg](./images/txn_6.png)
+
+事务A完成后，B事务查找Compares会失败
+
+![eg](./images/txn_7.png)
+
+重新查找得到mod_revision为12，然后直接用12来执行
+
+![eg](./images/txn_8.png)
+
+## boltdb
+etcd数据存储在boltdb上，boltdb是一个用Go语言编写的，基于B+树实现的，一个简单的、嵌入式的、持久化的KV数据库
+
+### boltdb磁盘布局
+boltdb文件指的是在etcd数据目录下的member/snap/db的文件，etcd的key-value、lease、meta、member、cluster、auth等所有数据存储在里面。etcd启动的时候，会通过mmap机制将db文件映射到内存，后续可从内存中快速读取文件中的数据。写请求通过fwrite和fdatasync来写入、持久化到磁盘中
+
+![boltdb](./images/boltdb_1.png)
+
+文件的内容由若干个page组成，一般情况下page size为4KB
+
+page按照功能可分为元数据页（meta page）、B+ tree索引节点页（branch page）、B+ tree叶子节点（leaf page）、空闲页管理页（freelist page）、空闲页（free page）
+
+文件最开头的两个page是固定的db元数据meta page，空闲页管理页记录了db中哪些页是空闲的、可使用的。索引节点页保存了B+ tree的内部节点，他们记录了key值，叶子节点页记录了B+ tree中的key-value和bucket数据
+
+boltdb逻辑上是通过B+ tree来管理branch/leaf page，实现快速查找、写入key-value数据
+
+### boltdb API
+boltdb提供了非常简单的API给上层业务使用，当我们执行一个put hello为world命令时，boltdb实际写入的key是版本号，value为mvccpb.KeyValue结构体
+
+假设往key bucket写入一个key为r94，value为world的字符串，其核心代码如下:
+```go
+// 打开boltdb文件，获取db对象
+db,err := bolt.Open("db"， 0600， nil)
+if err != nil {
+   log.Fatal(err)
+}
+defer db.Close()
+// 参数true表示创建一个写事务，false读事务
+tx,err := db.Begin(true)
+if err != nil {
+   return err
+}
+defer tx.Rollback()
+// 使用事务对象创建key bucket
+b,err := tx.CreatebucketIfNotExists([]byte("key"))
+if err != nil {
+   return err
+}
+// 使用bucket对象更新一个key
+if err := b.Put([]byte("r94"),[]byte("world")); err != nil {
+   return err
+}
+// 提交事务
+if err := tx.Commit(); err != nil {
+   return err
+}
+```
+
+### 核心数据结构介绍
+boltdb整个文件是由一个个page组成。最开头的两个page描述db元数据信息，而它正是在client调用boltdb Open API时被填充的
+
+boltdb本身自带了一个工具bbolt，它可以按页打印出db文件的十六机制内容
+
+`go install go.etcd.io/bbolt/cmd/bbolt@latest`
+
+`bbolt dump ./infra1.etcd/member/snap/db 0`
+
+相关结果
+![boltdb](./images/boltdb_2.png)
+
+解释说明
+![boltdb](./images/boltdb_3.png)
+
+### page磁盘页结构
+其由页ID（id）、页类型（flags）、数量（count）、溢出页数量（overflow）、页面数据起始位置（ptr）字段组成
+
+页类型目前有如下四种:
+1. 0x01: branch page
+2. 0x02: leaf page
+3. 0x04: meta page
+4. 0x10: freelist page
+数量字段仅在页类型为leaf和branch时生效，溢出页数量是指当前页面数据放不下的时候，需要向后再申请overflow个连续页面使用，页面数据起始位置指向page的载体数据，比如meta page、branch/leaf等page的内容
+
+### meta page数据结构
+前两页是固定存储db元数据的页（meta page），其由boltdb的文件标识（magic）、版本号（version）、页大小（pagesize）、boltdb的根bucket信息（root bucket）、freelist页面ID（freelist）、总的页面数量（pgid）、上一次写事务（txid）、校验码（checksum）组成
+
+### bucket数据结构
+可以使用bbolt buckets命令，输出一个db文件的bucket列表。执行完此命令后，可以看到auth、lease、meta等熟悉的bucket，它们都是etcd默认创建的
+
+![boltdb](./images/boltdb_4.png)
+
+meta page中，有一个名为root、类型bucket的重要数据结构，由root和sequence两个字段组成，root标识该bucket根节点的page id
+
+meta page中的bucket.root字段，存储的是db的root bucket页面信息，上面看到的key、lease、auth等bucket都是root bucket的子bucket
+
+```go
+type bucket struct {
+	root pgid // 根节点的page id
+	sequence uint64 // 序列号
+}
+```
+
+![bucket](./images/boltdb_5.png)
+
+meta page十六进制图中，第三行就是描述root bucket信息，其指向的page id为4，从上图可以知道是 leaf page，当bucket比较少时，子bucket数据可直接从meta page里指向的leaf page中找到
+
+### leaf page
+leaf page的磁盘布局如下图所示，前半部分是leafPageElement数组，后半部分是key-value数据
+
+![leaf page](./images/boltdb_6.png)
+
+leafPageElement包含leaf page的类型flags，通过它可以区分存储的是bucket名称还是key-value数据
+
+当flag是bucketLeafFlag（0x01）时，表示存储的是bucket数据，否则存储的是key-value数据，leafPageElement还含有key-value的读取变异量，key-value大小，根据偏移量和key-value大小，就可以方便地从leaf page中解析出所有key-value对
+
+当存储的是bucket数据的时候，key是bucket的名称，value是bucket结构信息。bucket结构信息含有root page信息，通过root page（基于B+ tree查找算法），可以快速找到存储在这个bucket下面的key-value数据所在页面
+
+boltdb还实现了inline bucket，在满足一些条件限制的情况下，可以将小的子bucket内嵌在它的父叶子结点上，友好的支持了大量小bucket
+
+### branch page
+boltdb采用了B+ Tree来高效管理所有bucket和key-value数据，因此它可以支持大量的bucket和key-value，只不过B+ tree的根节点不再直接指向leaf page，而是branch page索引节点页。branch page flags为0x01
+
+![branch page](./images/boltdb_7.png)
+
+branchPageElement包含key的读取偏移量、key大小、子节点的page id，根据偏移量和key大小，就可以方便的从branch page中解析出所有key，然后二分搜索匹配key，获取其子节点page id，递归搜索，直到从bucketLeafFlag类型的leaf page中找到目的bucket name
+
+boltdb在内存中使用了一个名为 node 的数据结构，来保存page反序列化的结果
+```go
+func (n *node) read(p *page) {
+   n.pgid = p.id
+   n.isLeaf = ((p.flags & leafPageFlag) != 0)
+   n.inodes = make(inodes, int(p.count))
+
+   for i := 0; i < int(p.count); i++ {
+      inode := &n.inodes[i]
+      if n.isLeaf {
+         elem := p.leafPageElement(uint16(i))
+         inode.flags = elem.flags
+         inode.key = elem.key()
+         inode.value = elem.value()
+      } else {
+         elem := p.branchPageElement(uint16(i))
+         inode.pgid = elem.pgid
+         inode.key = elem.key()
+      }
+   }
+```
+
+### freelist
+boltdb通过meta page中的freelist来管理页面的分配，freelist page中记录了哪些页是空闲的。当在boltdb中删除大量数据时，其对应的page就会被释放，页id存储到freelist所指向的空闲页中，写数据的时候，可以直接从空闲页中申请页面使用
+
+之前的图中 第四行 就是描述freelist信息，page id为3，通过bbolt page命令查看3号page内容，它会记录空闲页（4，5）相关信息
+
+![freelist](./images/boltdb_8.png)
+
+freelist page存储结构如下所示，pageflags为0x10，表示freelist类型的页，ptr指向空闲页id数组，其实在boltdb中支持通过多种数据结构（数组和hashmap）来管理free page，这里是数组
+
+![freelist](./images/boltdb_9.png)
+
+### Open原理
+boltdb Open API首先会打开db文件并对其增加文件锁，目的是防止其他进程也以读写模式打开它后，操作meta和fre page，导致db文件损坏
+
+boltdb会通过mmap将db文件映射到内存中，并读取两个meta page到db对象实例中，然后校验meta page的magic、version、checksum是否有效，若两个meta page都无效，那么db文件就出现了损坏，导致异常退出
+
+### Put原理
+
+根据我们上面介绍的bucket的核心原理，它首先是根据meta page中记录root bucket的root page，按照B+ tree的查找算法，从root page递归搜索到对应的叶子节点page面，返回key名称、leaf类型
+
+如果leaf类型为bucketLeafFlag，且key相等，那么说明已经创建过，不允许bucket重复创建，结束请求。否则往B+ tree中添加一个flag为bucketLeafFlag的key，key名称为bucket name，value为bucket的结构
+
+创建完bucket后，就可以通过bucket的Put API发起一个Put请求更新数据。它的核心原理跟bucket类似，根据子bucket的root page，从root page递归搜索此key到leaf page，如果没有找到，则在返回的位置处插入新key和value
+
+boltdb在内存中通过node数据结构来存储page磁盘页内容，它记录了key-value数据、page id、parent及children的node、B+ tree是否需要进行重平衡和分裂操作等信息。因此，当我们执行完一个put请求时，它只是将值更新到boltdb的内存node数据结构里，并未持久化到磁盘中。
+
+### 事务提交原理
+
+当代码执行tx.Commit API时，boltdb才会将上面保存的node内存数据结构中的数据，持久化到boltdb中
+
+![txn](./images/boltdb_10.png)
+
+插入了一个新的元素在B+ tree的叶子节点，它可能已不满足B+ tree的特性，因此事务提交时，第一步首先要调整B+ tree，进行重平衡、分裂操作，使其满足B+ tree树的特性。
+
+在重平衡、分裂过程中可能会申请、释放free page，freelist所管理的free page也发生了变化。因此事务提交的第二步，就是持久化freelist。
+
+注意，在etcd v3.4.9中，为了优化写性能等，freelist持久化功能是关闭的。etcd启动获取boltdb db对象的时候，boltdb会遍历所有page，构建空闲页列表。
+
+事务提交的第三步就是将client更新操作产生的dirty page通过fdatasync系统调用，持久化存储到磁盘中。
+
+最后，在执行写事务过程中，meta page的txid、freelist等字段会发生变化，因此事务的最后一步就是持久化meta page。
+
+**事务提交过程中若持久化key-value数据到磁盘成功了，此时突然掉电，元数据还未持久化到磁盘，那么db文件会损坏吗？数据会丢失吗？ 为什么boltdb有两个meta page呢？**
+
+1. boltbd采用的是 Copy-On-Write(COW)机制，写数据不会覆盖原来的，新找一块新的空闲页写入。如果写元数据meta还没开始或没写完掉电时，磁盘上确实会多一些新的KV数据页，但旧的Meta Page依然指向旧的 B+ Tree根节点；当数据库重启时，会读取旧的MetaPage
+2. 两个Meta Page就是为了应对最极端的风险: 写 Meta Page那一瞬间掉电。BoltDB在文件头的第0页和第1页各放了一个Meta Page，事务ID为N是写0，N+1时写1，每个Meta Page都有一个校验位。当启动时，boltdb会同时读取这两个Meta Page，如果都有效，那就选择 Transaction ID 更大的那个，如果其中一个因为掉电导致写入受损，会自动回滚使用另一个**旧但完整的Meta Page**
