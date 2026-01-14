@@ -1,0 +1,15 @@
+go 1.24.5
+
+use (
+	./Infra/etcd
+	./Languages/go/advanced
+	./Languages/go/package
+	./Languages/go/concurrency
+	./Languages/go/generic
+	./Languages/go/string
+	./Languages/Golang/PProf
+	./Languages/Golang/GoMock
+	./Languages/Golang/cobra
+	./Languages/Golang/Test
+	./Languages/Golang/GORM
+)
