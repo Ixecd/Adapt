@@ -703,3 +703,119 @@ boltdb在内存中通过node数据结构来存储page磁盘页内容，它记录
 
 1. boltbd采用的是 Copy-On-Write(COW)机制，写数据不会覆盖原来的，新找一块新的空闲页写入。如果写元数据meta还没开始或没写完掉电时，磁盘上确实会多一些新的KV数据页，但旧的Meta Page依然指向旧的 B+ Tree根节点；当数据库重启时，会读取旧的MetaPage
 2. 两个Meta Page就是为了应对最极端的风险: 写 Meta Page那一瞬间掉电。BoltDB在文件头的第0页和第1页各放了一个Meta Page，事务ID为N是写0，N+1时写1，每个Meta Page都有一个校验位。当启动时，boltdb会同时读取这两个Meta Page，如果都有效，那就选择 Transaction ID 更大的那个，如果其中一个因为掉电导致写入受损，会自动回滚使用另一个**旧但完整的Meta Page**
+
+## Compact
+
+etcd中的每一次更新、删除key操作，treeIndex的keyIndex索引中都会追加一个版本号，在boltdb中会生成一个新版本boltdb key和value。也就是随着不停更新、删除，etcd进程内存占用和db文件就会越来越大。很显然，这会导致etcd OOM和db大小增长到最大配额，最终不可写
+
+### 整体架构
+
+![compact](./images/compact_1.png)
+
+首先可以通过client API发起人工的压缩（Compact）操作，也可以配置自动压缩策略。在自动压缩策略中，可以根据业务场景选择合适的压缩模式。目前etcd支持两种压缩模式，分别是时间周期性压缩和版本号压缩
+
+当通过API发起一个Compact请求后，KV Server收到Compact请求提交到Raft模块处理，在Raft模块中提交后，Apply模块就会通过MVCC模块的Compact接口执行此压缩任务
+
+Compact接口首先会更新当前server已压缩的版本号，并将耗时昂贵的压缩任务保存到FIFO队列中异步执行。压缩任务执行时，它首先会压缩treeIndex模块中的keyIndex索引，其次会遍历boltdb中的key，删除已废弃的key
+
+### 压缩特性初体验
+在使用etcd过程中，当遇到「etcdserver: mvcc: database space exceeded」错误时，如果你未开启压缩策略导致db大小达到配额，这时可以使用etcdctl compact命令来主动触发压缩操作，回收历史版本
+
+```sh
+# 获取etcd当前版本号revision
+rev = $(etcdctl endpoint status --write-out="json" | egrep -o '"revision":[0-9]*' | egrep -o '[0-9].*')
+echo $rev
+
+# 执行压缩操作，指定压缩的版本号为当前版本号
+etcdctl compact $rev
+
+# 压缩一个☝🏻已经压缩的版本号
+etcdctl compact $rev
+
+# 压缩一个比当前版本号大的版本号
+etcdctl compact $((rev + 1))
+```
+
+![compact](./images/compact_2.png)
+
+如果压缩命令传递的版本号小于等于当前etcd server记录的压缩版本号，etcd server会返回已压缩错误「mvcc: required revision has been compacted」给client。如果版本号大于当前etcd server最新的版本号，etcd server则会返回一个未来版本号错误给client「mvcc: required revision is a future revision」
+
+这里压缩的本质是**回收历史版本**，目标对象仅是**历史版本**，不包括一个key-value数据的最新版本，因此可以放心执行压缩命令，不会删除最新的数据。但是Watch特性中的历史版本数据同步，依赖于MVCC中是否还保存了相关数据，所以不建议每次简单粗暴地回收所有历史版本
+
+在生产环境中，建议精细化的控制历史版本数
+
+1. 使用etcd server自带的自动压缩机制，根据业务场景，配置合适的压缩策略即可
+
+2. 基于etcd的Compact API，在业务逻辑代码中、或定时任务中主动触发压缩操作，但是dev需要确保发起Compact操作的程序高可用，压缩的频率、保留的历史版本在合理范围内，并最终能使etcd的 db 大小保持平稳
+
+建议使用etcd自带的压缩机制，它支持两种模式，分别是按时间周期性压缩和保留版本号的压缩，配置相应策略后，etcd节点会自动化的发起Compact操作
+
+### 周期性压缩
+
+etcd server 提供了配置压缩模式和保留时间的参数
+```sh
+--auto-compaction-retention '0'
+Auto compaction retention length. 0 means disable auto Compaction.
+--auto-compaction-mode 'periodic'
+Interpret 'auto-Compaction-retention' one of: periodic|revision.
+```
+
+auto-compaction-mode为periodic时，它表示启用时间周期性压缩，auto-compaction-retention为保留的时间的周期，比如1h
+
+auto-compaction-mode为revision时，它表示启用版本号压缩模式，auto-compaction-retention为保留的历史版本号数，比如10000
+
+如果 etcd server 的 auto-compaction-retention为「0」，将关闭自动压缩策略
+
+etcd server启动后，根据配置的模式periodic，会创建periodic Compactor，它会异步的获取、记录过去一段时间的版本号。periodic Compactor组件获取设置的压缩间隔参数1h，并将其划分成10个区间，也就是每个区间6分钟。每隔6分钟，它会通过etcd MVCC模块的接口获取当前的server版本号，追加到rev数组中
+
+因为只需要保留过去1小时的历史版本，periodic Compactor组件会通过当前时间减去上一次成功执行Compact操作的时间，如果间隔大于1小时，它就会取出rev数组的首元素，通过etcd server的Compact接口，发起压缩操作
+
+### 版本号压缩
+
+当请求比较多，可能产生比较多的历史版本导致db增长时，或者不确定配置periodic周期为多少才是最佳的时候，可以通过设置压缩模式为revision，指定保留的历史版本号数。如果希望etcd尽量只保存1万个历史版本，那么可以指定compaction-mode为revision，auto-compaction-retention为10000
+
+etcd启动后会根据压缩模式revision，创建revision Compactor。revision Compactor会根据设置的保留版本号数，每隔5分钟定时获取当前server的最大版本号，减去想保留的历史版本数，然后通过etcd server的Compact接口发起压缩操作即可
+
+```go
+# 获取当前版本号，减去保留的版本号数
+rev := rc.rg.Rev() - rc.retention
+# 调用server的Compact接口压缩
+_，err := rc.c.Compact(rc.ctx，&pb.CompactionRequest{Revision: rev})
+```
+
+### 压缩原理
+MVCC模块的Compact接口首先会检查Compact请求的版本号rev是否已被压缩过，若是则返回ErrCompacted错误给client。其次会检查rev是否大于当前etcd server的最大版本号，若是则返回ErrFutureRev给client
+
+通过检查后，Compact接口会通过boltdb的API在meta bucket中更新当前已调度的压缩版本号(scheduledCompactedRev)号，然后将压缩任务追加到FIFO Scheduled中，异步调度执行。
+
+![compact](./images/compact_3.png)
+
+Compact接口需要持久化鵆当前已调度的压缩版本号到boltdb中，因为如果不保存，etcd在异步执行Compact任务过程中crash了，那么异常节点重启后，各个节点数据就会不一致。因此，etcd通过持久化存储scheduledCompactedRev，节点Crash重启后，会重新向FIFO Scheduled中添加压缩任务，保证各个节点间的数据一致性
+
+treeIndex索引模块，是etcd支持保存历史版本的核心模块，每个key在treeIndex模块中都有一个keyIndex数据结构，记录其历史版本号信息
+
+![compact](./images/compact_4.png)
+
+异步压缩任务的第一项工作，就是**压缩treeIndex模块中的各key的历史版本**、已删除的版本。为了避免压缩工作影响读写性能，首先会克隆一个B-tree，然后通过克隆后的B-tree遍历每一个keyIndex对象，压缩历史版本号、清理已删除的版本
+
+假设当前压缩的版本号是CompactedRev，它会保留keyIndex中最大的版本号，移除小于等于CompactedRev的版本号，并通过一个map记录treeIndex中有效的版本号返回给boltdb模块使用。这里因为最大版本号是这个key的最新版本，移除了会导致key丢失。而Compact的目的是回收旧版本。如果keyIndex中的最大版本号被打了删除标记（tombstone），就会从treeIndex中删除这个keyIndex，否则会出现内存泄露
+
+Compact任务执行完索引压缩后，它通过遍历B-tree、keyIndex中的所有generation获得当前内存索引模块中有效的版本号，这些信息将帮助etcd清理boltdb中的废弃历史版本
+
+![compact](./images/compact_5.png)
+
+压缩任务的第二项工作，就是**清理boltdb中的废弃历史版本**。scheduleCompaction任务会根据key区间，从0到CompactedRev遍历boltdb中的所有key，通过treeIndex模块返回的有效索引信息，判断这个key是否有效，无效则调用boltdb的delete接口将key-value删除
+
+在这过程中，scheduleCompaciton任务还会更新当前etcd已经完成的压缩版本号（finishedCompactRev），将其保存到boltdb的meta bucket中
+
+scheduleCompaction任务遍历、删除key的过程可能会对boltdb造成压力，为了不影响读写请求，在执行过程中会通过参数控制每次遍历、删除的key数（默认为100，每批间隔10ms），分批完成boltdb key的删除操作
+
+### 为什么压缩后db大小不减少？
+boltdb将db文件划分成若干个page页，page页又有四种类型，分别是meta page、branch page、leaf page以及freelist page。branch page保存B+ tree的非叶子节点key数据，leaf page保存bucket和key-value数据，freelist会记录哪些页是空闲的
+
+当我们通过boltdb删除大量的key，在事务提交后B+ tree经过分裂、平衡，会释放出若干branch/leaf page页面，然而boltdb并不会将其释放给磁盘，调整db大小操作是昂贵的，会对性能有较大的损害
+
+boltdb是通过freelist page记录这些空闲页的分布位置，当收到新的写请求时，优先从空闲页数组中申请若干连续页使用，实现高性能的读写（而不是直接扩大db大小）。当连续空闲页申请无法得到满足的时候，boltdb才会通过增大db大小来补充空闲页
+
+一般情况下，压缩操作释放的空闲页就能满足后续新增写请求的空闲页需求，db大小会趋于整体稳定
+
