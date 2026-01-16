@@ -819,3 +819,243 @@ boltdb是通过freelist page记录这些空闲页的分布位置，当收到新�
 
 一般情况下，压缩操作释放的空闲页就能满足后续新增写请求的空闲页需求，db大小会趋于整体稳定
 
+## 为啥基于Raft实现的etcd还会出现数据不一致？
+现象: 用户在更新Kubernetes集群中的Deployment资源镜像后，无法创建出新Pod，Deployment控制器莫名其妙不工作了。更诡异的是，部分Node莫名奇妙消失了（其实Node在）
+
+### 消失的Node
+排查思路: APIServer -> ControllerManager -> Scheduler 等组件，之后查看 etcd 集群各节点状态，发现都没有问题
+
+结果: 基于Raft实现的强一致性存储竟然出现不一致、数据丢失（其实并非Raft本身设计缺陷，而是实现层面的bug、边缘场景或运维问题）
+
+备注: 上面的issue在旧版本（尤其是v3.5之前）确实存在此问题。但是最新版本已基本解决
+
+根据etcd写流程，来排查问题
+![raft](./images/raft_1.png)
+
+猜测:
+
+1. etcd集群出现分裂，三个节点分裂成两个集群。APIServer配置的后端etcd server地址是三个节点，APIServer并不会检查各节点集群ID是否一致，因此如果分裂，有可能会出现数据「消失」现象
+
+2. Raft日志同步异常，其他两个节点会不会因为Raft模块存在特殊Bug导致未收到相关日志条目？这种情况可以通过etcd自带的WAL工具来判断，其可以显示WAL日志中收到的命令（4，5，6）
+
+3. 如果日志同步没有问题，那么是不是Apply模块出现了问题，导致日志条目未被应用到MVCC模块？（7）
+
+4. 如果Apply模块执行了相关日志条目到MVCC模块，MVCC模块的treeIndex子模块会不会出现了特殊Bug？导致更新流程失败？（8）
+
+5. 如果MVCC模块的treeIndex模块无异常，写请求到了boltdb存储模块，有没有可能boltdb出现了极端异常导致丢失数据呢？（9）
+
+开始不断抽丝剥茧、明察秋毫、一步一步探寻真相
+
+首先从故障定位第一工具「日志」开始。查看etcd节点日志没发现任何异常日志，但是当查看APIServer日志的时候，发现持续出现「required revision has been compacted」错误，原因一般是「APIServer请求etcd版本号被压缩」
+
+通过如下命令查看etcd节点的详细状态信息
+
+```sh
+etcdctl endpoint status --cluster -w json | jq
+```
+
+1. 判断集群是否分裂，集群中的所有节点 cluster id 是否一致
+
+2. 初步判断集群Raft日志条目同步正常，raftIndex表示Raft日志索引号，raftAppliedIndex表示当前状态机应用的日志索引号（这里我本机的因为没问题，所以每个节点的raftIndex和raftAppliedIndex相同，但是三个节点的raftIndex和raftAppliedIndex不同）这两个核心字段显示三个节点相差很小，考虑到正在写入，未偏离正常范围，Raft同步Bug导致数据丢失也大概率可以排除，最好还是用WAL工具验证下现在日志条目同步和写入WAL是否正常
+
+验证Raft日志同步正常
+
+首先写入一个值，然后马上在各个节点上用WAL工具etcd-dump-logs搜索
+![raft](./images/raft_2.png)
+
+```sh
+etcdctl put hello_ world_
+
+etcd-dump-logs ./infra1.etcd/ | grep hello_
+
+etcd-dump-logs ./infra2.etcd/ | grep hello_
+
+etcd-dump-logs ./infra3.etcd/ | grep hello_
+```
+
+如果都能找到，那么说明日志条目同步正常
+
+3. 观察三个节点的revision值（我本机都相同），相互之间最大差距如果过大，有明显偏离标准值
+
+源码面前了无秘密🤫，etcd更新raftAppliedIndex核心代码如下所示。Apply流程出现逻辑错误时，并没有重试机制。etcd无论Apply流程是成功还是失败，都会更新raftAppliedIndex值。也就是说一个请求在Apply或MVCC模块即便执行失败了，都依然会更新raftAppliedIndex
+
+```go
+// ApplyEntryNormal apples an EntryNormal type Raftpb request to the EtcdServer
+func （s *EtcdServer） ApplyEntryNormal（e *Raftpb.Entry） {
+   shouldApplyV3 := false
+   if e.Index > s.consistIndex.ConsistentIndex（） {
+      // set the consistent index of current executing entry
+      s.consistIndex.setConsistentIndex（e.Index）
+      shouldApplyV3 = true
+   }
+   defer s.setAppliedIndex（e.Index）
+   ....
+}
+```
+
+最新版本的代码如下所示
+
+```go
+// applyEntryNormal applies an EntryNormal type raftpb request to the EtcdServer
+func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry, shouldApplyV3 membership.ShouldApplyV3) {
+	if shouldApplyV3 {
+		defer func() {
+			// The txPostLockInsideApplyHook will not get called in some cases,
+			// in which we should move the consistent index forward directly.
+			newIndex := s.consistIndex.ConsistentIndex()
+			if newIndex < e.Index {
+				s.consistIndex.SetConsistentIndex(e.Index, e.Term)
+			}
+		}()
+	}
+
+	// raft state machine may generate noop entry when leader confirmation.
+	// skip it in advance to avoid some potential bug in the future
+	if len(e.Data) == 0 {
+		s.firstCommitInTerm.Notify()
+
+		// promote lessor when the local member is leader and finished
+		// applying all entries from the last term.
+		if s.isLeader() {
+			s.lessor.Promote(s.Cfg.ElectionTimeout())
+		}
+		return
+	}
+
+	ar, id := apply.Apply(s.lg, e, s.uberApply, s.w, shouldApplyV3)
+
+	// do not re-toApply applied entries.
+	if !shouldApplyV3 {
+		return
+	}
+
+	if ar == nil {
+		return
+	}
+
+	if !errorspkg.Is(ar.Err, errors.ErrNoSpace) || len(s.alarmStore.Get(pb.AlarmType_NOSPACE)) > 0 {
+		s.w.Trigger(id, ar)
+		return
+	}
+
+	lg := s.Logger()
+	lg.Warn(
+		"message exceeded backend quota; raising alarm",
+		zap.Int64("quota-size-bytes", s.Cfg.QuotaBackendBytes),
+		zap.String("quota-size", humanize.Bytes(uint64(s.Cfg.QuotaBackendBytes))),
+		zap.Error(ar.Err),
+	)
+
+	s.GoAttach(func() {
+		a := &pb.AlarmRequest{
+			MemberID: uint64(s.MemberID()),
+			Action:   pb.AlarmRequest_ACTIVATE,
+			Alarm:    pb.AlarmType_NOSPACE,
+		}
+		s.raftRequest(s.ctx, pb.InternalRaftRequest{Alarm: a})
+		s.w.Trigger(id, ar)
+	})
+}
+```
+
+对比一下可以发现
+   
+   1. 重构 shouldApplyV3 的决定逻辑，更精细的控制，避免内部硬编码判断，修复了旧版本中的逻辑缺陷
+   2. Consistent Index前进更加安全
+   3. 更好的边缘case处理
+   4. Quota报警处理更健壮
+
+三个节点revision差异偏离标准值，恰好又说明异常etcd节点可能未成功应用日志条目到MVCC模块。所以可以通过查看MVCC的相关metrics来判断（etcd_mvcc_put_totol），来排除请求是否到了MVCC模块，事实是丢数据节点的metrics指标值的确远远落后于正常节点
+
+所以真凶在Apply流程上，所以在Apply流程未向MVCC模块提交请求前以及可能提前返回的地方，都加上日志，然后再走一遍流程，马上出现一条错误日志「auth: revision in header is old」
+
+写入成功还跟client连接的节点有关，连接不同节点会出现不同的写入结果
+
+数据不一致是因为鉴权版本号不一致导致的，节点在Apply流程的时候，会判断Raft日志条目中的请求鉴权版本号是否小于当前鉴权版本号，如果小于就拒绝写入
+
+那就得去看可能修改鉴权版本号的源码分析了🧐，只有鉴权相关的接口才会修改它，要解决就再次复现😅
+
+要基于混沌工程，不断模拟真实业务场景、访问鉴权接口、注入故障（停止etcd进程等）
+
+真相大白: 当无意间重启etcd的时候，如果最后一条命令是鉴权相关的，它并不会持久化consistent index（KV接口会持久化）consistent key具有幂等作用，可防止命令重复执行，consistent index的未持久化最终导致鉴权命令重复执行。恰好鉴权模块的RoleGrantPermission接口未实现幂等，重复执行会修改鉴权版本号。一连串的Bug最终导致鉴权号出现不一致，最后又放大成MVCC模块的key-value数据不一致，导致严重的数据损坏。etcd v3.3.21和v3.4.8后的版本已经修复此Bug。
+
+### 为什么会不一致
+etcd各个节点数据一致性是基于raft算法的日志复制实现的，etcd是个基于复制状态机实现的分布式系统。下图是分布式复制状态机原理架构，核心由三个组件组成，一致性模块、日志、状态机，其工作流程如下：
+
+![raft](./images/raft_4.png)
+
+1. client发起一个写请求（put x = 3）
+
+2. server向一致性模块（假设是Raft）提交请求，一致性模块生成一个写提案日志条目。如果server是Leader，把日志条目广播给其他节点，并持久化日志条目到WAL中
+
+3. 当一半以上的节点持久化日志条目后，Leader的一致性模块将此日志条目标记为已提交（committed），并通知其他节点提交
+
+4. server从一致性模块获取已经提交的日志条目，异步应用到状态机持久化存储中（boltdb等），然后返回给client
+
+在基于复制状态机实现的分布式存储系统中，Raft等一致性算法只能确保各个节点的日志一致性，也就是流程2
+
+对于流程3来说，server从日志里面获取已经提交的日志条目，将其应用到状态机的过程，跟Raft算法本身无关，属于server本身的数据存储逻辑
+
+也就是说可能存在「server应用日志到状态机失败，进而导致各个节点出现数据不一致」的情况，但是这个不一致并非Raft模块导致的，它已超过Raft模块的功能界限
+
+Node莫名奇妙消失，就是应用日志条目到状态机流程中，出现逻辑错误，导致key-value数据未能持久化存储到boltdb中
+
+### 其他典型不一致Bug
+
+这个故障对外的表现也是令人摸不着头脑，有服务不调度的、有service下的endpoint不更新的。最终我经过一番排查发现，原来数据不一致是由于etcd 3.2和3.3版本Lease模块的Revoke Lease行为不一致造成
+
+etcd 3.2版本的RevokeLease接口不需要鉴权，而etcd 3.3 RevokeLease接口增加了鉴权，因此当你升级etcd集群的时候，如果etcd 3.3版本收到了来自3.2版本的RevokeLease接口，就会导致因为没权限出现Apply失败，进而导致数据不一致，引发各种诡异现象
+
+除了重启etcd、升级etcd可能会导致数据不一致，defrag操作也可能会导致不一致
+
+对一个defrag碎片整理来说，它是如何触发数据不一致的呢？ 触发的条件是defrag未正常结束时会生成db.tmp临时文件。这个文件可能包含部分上一次defrag写入的部分key/value数据，而etcd下次defrag时并不会清理它，复用后就可能会出现各种异常场景，如重启后key增多、删除的用户数据key再次出现、删除user/role再次出现等
+
+etcd 3.2.29、etcd 3.3.19、etcd 3.4.4后的版本都已经修复这个Bug。建议根据自己实际情况进行升级，否则踩坑后，数据不一致的修复工作是非常棘手的，风险度极高。
+
+「**算法一致性不代表一个庞大的分布式系统工程实现中一定能保障一致性，工程实现上充满着各种挑战，从不可靠的网络环境到时钟、再到人为错误、各模块间的复杂交互等，几乎没有一个存储系统能保证任意分支逻辑能被测试用例100%覆盖。**」🤯
+
+复制状态机在给我们带来数据同步的便利基础上，也给上层逻辑开发提出了高要求。也就是说任何接口逻辑变更etcd需要保证兼容性，否则就很容易出现Apply流程失败，导致数据不一致
+
+### 最佳实践
+
+#### 开启etcd的数据毁坏检测功能
+
+etcd不仅支持在启动的时候，通过–experimental-initial-corrupt-check参数检查各个节点数据是否一致，也支持在运行过程通过指定–experimental-corrupt-check-time参数每隔一定时间检查数据一致性
+
+其实无非就是想确定boltdb文件里面的内容跟其他节点内容是否一致。因此我们可以枚举所有key value，然后比较即可
+
+etcd的实现也就是通过遍历treeIndex模块中的所有key获取到版本号，然后再根据版本号从boltdb里面获取key的value，使用crc32 hash算法，将bucket name、key、value组合起来计算它的hash值
+
+如果开启了–experimental-initial-corrupt-check，启动的时候每个节点都会去获取peer节点的boltdb hash值，然后相互对比，如果不相等就会无法启动
+
+而定时检测是指Leader节点获取它当前最新的版本号，并通过Raft模块的ReadIndex机制确认Leader身份。当确认完成后，获取各个节点的revision和boltdb hash值，若出现Follower节点的revision大于Leader等异常情况时，就可以认为不一致，发送corrupt告警，触发集群corruption保护，拒绝读写
+
+### 应用层的数据一致性检测
+
+数据不一致在MVCC、boltdb会出现很多种情况，比如说key数量不一致、etcd逻辑时钟版本号不一致、MVCC模块收到的put操作metrics指标值不一致等等。因此我们的应用层检测方法就是基于它们的差异进行巡检
+
+首先针对key数量不一致的情况，我们可以实现巡检功能，定时去统计各个节点的key数，这样可以快速地发现数据不一致，从而及时介入，控制数据不一致影响，降低风险
+
+统计节点key数时，记得查询的时候带上WithCountOnly参数。etcd从treeIndex模块获取到key数后就及时返回了，无需访问boltdb模块。如果数据量非常大（涉及到百万级别），那即便是从treeIndex模块返回也会有一定的内存开销，因为它会把key追加到一个数组里面返回
+
+而在WithCountOnly场景中，我们只需要统计key数即可。对百万级别的key来说，WithCountOnly时内存开销从数G到几乎零开销，性能也提升数十倍
+
+其次我们可以基于endpoint各个节点的revision信息做一致性监控。一般情况下，各个节点的差异是极小的
+
+我们还可以基于etcd MVCC的metrics指标来监控。比如上面提到的mvcc_put_total，理论上每个节点这些MVCC指标是一致的，不会出现偏离太多
+
+### 定时数据备份
+
+etcd数据不一致的修复工作极其棘手。发生数据不一致后，各个节点可能都包含部分最新数据和脏数据。如果最终无法修复，那就只能使用备份数据来恢复了
+
+因此备份特别重要，备份可以保障我们在极端场景下，能有保底的机制去恢复业务。请记住，在做任何重要变更前一定先备份数据，以及在生产环境中建议增加定期的数据备份机制（比如每隔30分钟备份一次数据）
+
+可以使用开源的etcd-operator中的backup-operator去实现定时数据备份，它可以将etcd快照保存在各个公有云的对象存储服务里面
+
+### 良好的运维规范
+
+首先是确保集群中各节点etcd版本一致。若各个节点的版本不一致，因各版本逻辑存在差异性，这就会增大触发不一致Bug的概率
+
+其次是优先使用较新稳定版本的etcd。像上面提到的3个不一致Bug，在最新的etcd版本中都得到了修复。可以根据自己情况进行升级，以避免下次踩坑。同时可根据实际业务场景以及安全风险，来评估是否有必要开启鉴权，开启鉴权后涉及的逻辑更复杂，有可能增大触发数据不一致Bug的概率
+
+最后是在升级etcd版本的时候，需要多查看change log，评估是否存在可能有不兼容的特性。在你升级集群的时候注意先在测试环境多验证，生产环境务必先灰度、再全量。
