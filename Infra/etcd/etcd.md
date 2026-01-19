@@ -1059,3 +1059,114 @@ etcd数据不一致的修复工作极其棘手。发生数据不一致后，各�
 其次是优先使用较新稳定版本的etcd。像上面提到的3个不一致Bug，在最新的etcd版本中都得到了修复。可以根据自己情况进行升级，以避免下次踩坑。同时可根据实际业务场景以及安全风险，来评估是否有必要开启鉴权，开启鉴权后涉及的逻辑更复杂，有可能增大触发数据不一致Bug的概率
 
 最后是在升级etcd版本的时候，需要多查看change log，评估是否存在可能有不兼容的特性。在你升级集群的时候注意先在测试环境多验证，生产环境务必先灰度、再全量。
+
+## 为啥etcd社区建议boltdb大小不超过8G?
+
+1. **启动耗时**: etcd启动的时候，需要打开boltdb db文件，读取db文件中所有key-value数据，用于重构内存treeIndex模块。因此在大量key导致db文件过大的场景中，会导致etcd启动较慢
+
+2. **节点内存配置**: etcd在启动时会通过mmap将db文件映射到内存中，如果节点可用内存不足，小于db文件大小时，可能会出现缺页中断，导致服务稳定性、性能下降
+
+3. **treeIndex索引性能**: 因etcd不支持数据分片，内存中的treeIndex如果保存了几十万到上千万的key，这户增加查询、修改操作的整体延迟
+
+4. **boltdb性能**: 大db文件场景会导致事务提交耗时增长、抖动
+
+5. **集群稳定性**: 大db文件场景下，无论是百万级别小key还是上千个大value场景，一旦出现expensive request后，很容易出现etcd OOM、节点带宽满而丢包
+
+6. **快照**: 当Follower节点落后Leader较多数据的时候，会触发Leader生成快照重建发送给Follower节点，Follower基于它进行还原重建操作。较大的db文件会导致Leader发送快照需要消耗较多的CPU、网络带宽资源，同时Follower节点重建还原满
+
+### 构建大集群
+首先通过一些列 benchmark 命令，向一个8核32G的3节点的集群写入120万左右key。key大小为32，value大小为10k
+
+```bash
+./benchmark put --key-size 32 --val-size 10240 --total 1000000 --key-space-size 2000000 --clients 50 --conns 50
+```
+
+执行完上面benchmark命令后，db size大概可以达到14G，总key数可以达到120万
+
+### 启动耗时
+通过对etcd启动流程增加耗时统计，核心瓶颈主要在于打开db文件和重建内存treeIndex模块
+
+treeIndex模块维护了用户key与boltdb key的映射关系，boltdb的key、value又包含了构建treeIndex的所需的数据。etcd启动的时候，会启动不同角色的goroutine并发完成treeIndex构建
+
+**首先是主goroutine**。它的职责是遍历boltdb，获取所有key-value数据，并将其反序列化成etcd的mvccpb.KeyValue结构。核心原理是基于etcd存储在boltdb中的key数据有序性，按版本号从1开始批量遍历，每次查询10000条key-value记录，直到查询数据为空
+
+**其次是构建treeIndex索引的goroutine**。它从主goroutine获取mvccpb.KeyValue数据，基于key、版本号、是否带删除标识等信息，构建keyIndex对象，插入到treeIndex模块的B-tree中
+
+因可能存在多个goroutine并发操作treeIndex，treeIndex的Insert函数会加全局锁。etcd启动时只有一个**构建treeIndex索引的goroutine**，因此key多时，会比较慢
+
+```go
+func (ti *treeIndex) Insert(ki *keyIndex) {
+	ti.Lock()
+	defer ti.Unlock()
+	ti.tree.ReplaceOrInsert(ki)
+}
+```
+
+### 节点内存配置
+etcd进程重启完成后，在没有任何读写QPS情况下，有可能出现etcd所消耗内存比db大小还大一点的情况
+
+etcd在启动的时候，会通过boltdb的Open API获取数据库对象，而Open API它会通过mmap机制将db文件映射到内存中
+
+由于etcd调用boltdb Open API的时候，设置了mmap的MAP_POPULATE flag，它会告诉Linux内核预读文件，将db文件全部从磁盘加载到物理内存中
+
+在内存充足的情况下，启动后会看到etcd占用内存，一般是db文件大小与内存treeIndex之和。client后续发起对etcd的读操作，可直接通过内存获取boltdb的key-value数据，不会产生任何磁盘IO，具备良好的读性能、稳定性
+
+而当db文件大小超过节点内存配置时，如果查询的key所相关的branch page、leaf page不在内存中，就会触发缺页中断，导致读延迟抖动、QPS下降
+
+所以，为了保证etcd集群的稳定性，需要etcd节点内存规格要大于etcd db文件大小
+
+### treeIndex
+
+当往集群不停写入数据之后，再读取一个key范围操作的延时会出现一定程度上升。通过trace特性，来定位、分析请求耗时过长问题。主要原因大概就是此次查询设计的key数较多
+
+### boltdb性能
+
+当 DB 文件大小持续增长到 16G 以及更大后，在较老的 etcd 版本（例如 3.4 及更早）中，从 etcd 事务提交监控 metrics 可能会观察到，boltdb 在提交事务时偶尔出现较高延时
+
+事务提交延时抖动的原因主要是在 B+ tree 树的重平衡和分裂过程中，它需要从 freelist 中申请若干连续的 page 存储数据，或释放空闲的 page 到 freelist
+
+freelist 后端实现在早期 BoltDB 中是 array。当申请一个连续的 n 个 page 存储数据时，它会遍历 BoltDB 中所有的空闲页，直到找到连续的 n 个 page。因此它的时间复杂度是 O(N)。若 DB 文件较大，又存在大量的碎片空闲页，很可能导致较高延时
+
+同时事务提交过程中，也可能会释放若干个 page 给 freelist，因此需要合并到 freelist 的数组中，此操作时间复杂度是 O(N log N)
+
+假设我们 DB 大小 16G，page size 4KB，则有 400 万个 page。经过各种修改、压缩后，若存在一半零散分布的碎片空闲页，在最坏的场景下，etcd 每次事务提交需要遍历 200 万个 page 才能找到连续的 n 个 page，同时还需要持久化 freelist 到磁盘
+
+为了优化 BoltDB 事务提交的性能，etcd 社区在 bbolt 项目（BoltDB 的 fork）中，实现了基于 hashmap 来管理 freelist。通过引入了如下的三个 map 数据结构（freemaps 的 key 是连续的页数，value 是以空闲页的起始页 pgid 集合，forwardmap 和 backmap 用于释放的时候快速合并页），将申请和释放时间复杂度降低到了 O(1)
+
+freelist 后端实现可以通过 bbolt 的 FreeListType 参数来控制，支持 array 和 hashmap。从 etcd 3.5 版本（2021 年发布）开始，默认已切换为 hashmap 类型，且该实现已稳定成熟。在当前的 etcd 最新版本（2026 年为 v3.6.x 或更高）中，默认继续使用 hashmap freelist，大幅降低了大规模 DB 下的提交延时抖动问题
+
+```go
+freemaps		map[uint64]pidSet
+forwordMap		map[pgid]uint64
+backwardMap		map[pgid]uint64
+```
+
+### 集群稳定性
+
+db文件增大后，另外一个非常大的隐患是用户client发起的expensive request，容易导致集群出现各种稳定性问题
+
+本质原因就是etcd不支持数据分片，各个节点保存了所有key-value数据，同时他们又存储在boltdb的一个bucket里面，当集群含有百万级以上key的时候，任意一种expensive read请求都可能导致etcd出现OOM、丢包等情况发生
+
+1. count only查询。当想通过API来统计一个集群内有多少个key时，如果key较多，则有可能导致内存突增和较大的延时
+
+2. limit查询。当只想查询若干条数据的时候，如果key较多，也会导致类似count only查询的性能、稳定性问题
+
+3. 大包查询。当未分页批量遍历key-value数据或单key-value数据较大的时候，随着QPS增大，etcd OOM、节点出现带宽瓶颈导致丢包的风险会越来越大
+
+第一，etcd需要遍历treeIndex获取key列表。若未分页，一次查询万级key，显然会消耗大量内存并且高延时
+
+第二，获取到key列表、版本号后，etcd需要遍历boltdb，将key-value保存到查询结果数据结构中。一个请求可能在遍历boltdb时花费很长时间，同时可能会消耗几百M甚至数G的内存。随着请求QPS增大，极易出现OOM、丢包等
+
+### 快照
+
+大db文件会影响db备份文件生成速度、Leader发送快照给Follower节点的资源开销、Follower节点通过快照重建恢复的速度。
+
+etcd提供了快照功能，帮助通过API即可备份etcd数据。当etcd收到snapshot请求的时候，它会通过boltdb接口创建一个只读事务Tx，随后通过事务的WriteTo接口，将meta page和data page拷贝到buffer即可
+
+但是随着db文件增大，快照事务执行的时间也会越来越长，而长事务则会导致db文件大小发生显著增加
+
+也就是说当db大时，生成快照不仅慢，生成快照时可能还会触发db文件大小持续增长，最终达到配额限制
+
+快照的另一大作用是当Follower节点异常的时候，Leader生成快照发送给Follower节点，Follower使用快照重建并追赶上Leader。此过程涉及到一定的CPU、内存、网络带宽等资源开销
+
+同时，若快照和集群写QPS较大，Leader发送快照给Follower和Follower应用快照到状态机的流程会耗费较长的时间，这可能会导致基于快照重建后的Follower依然无法通过正常的日志复制模式来追赶Leader，只能继续触发Leader生成快照，进而进入死循环，Follower一直处于异常中
