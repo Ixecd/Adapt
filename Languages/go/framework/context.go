@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"time"
 	"fmt"
+	"time"
 )
 
 func request(ctx context.Context) {
@@ -16,9 +16,9 @@ func request(ctx context.Context) {
 	// do something
 
 	select {
-	case v := <- resp:
+	case v := <-resp:
 		println(v)
-	case <- ctx.Done():
+	case <-ctx.Done():
 		println(ctx.Err().Error())
 	}
 }
@@ -38,7 +38,7 @@ func cache(ctx context.Context, resp chan<- int) {
 
 func database(ctx context.Context, resp chan<- int) {
 	select {
-	case <- ctx.Done():
+	case <-ctx.Done():
 		println("3/3 database: timeout!")
 		return
 	default:
@@ -47,7 +47,7 @@ func database(ctx context.Context, resp chan<- int) {
 	println("3/3 database")
 }
 
-func main() {
+func test() {
 
 	// chain: request -> handle -> cache -> database
 	request(context.Background())
