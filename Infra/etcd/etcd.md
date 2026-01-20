@@ -1170,3 +1170,116 @@ etcd提供了快照功能，帮助通过API即可备份etcd数据。当etcd收�
 快照的另一大作用是当Follower节点异常的时候，Leader生成快照发送给Follower节点，Follower使用快照重建并追赶上Leader。此过程涉及到一定的CPU、内存、网络带宽等资源开销
 
 同时，若快照和集群写QPS较大，Leader发送快照给Follower和Follower应用快照到状态机的流程会耗费较长的时间，这可能会导致基于快照重建后的Follower依然无法通过正常的日志复制模式来追赶Leader，只能继续触发Leader生成快照，进而进入死循环，Follower一直处于异常中
+
+## 为啥etcd请求会出现超时？
+
+知己知彼，方能百战不殆，定位问题也是类似。首先要弄清楚产生问题的原理、流程，其次是熟练掌握相关工具
+
+Leader收到一个写请求，将一条日志条目复制到集群多数节点并应用到存储状态机的流程，如下图所示，可以根据这个图来判断写流程上那些地方可能导致请求超时
+
+![写流程](./images/delay_1.png)
+
+首先是流程四，一方面，Leader需要并行将消息通过网络发送给各Follower节点，依赖网络性能。另一方面，Leader需要持久化日志条目到WAL，依赖磁盘IO顺序写入性能
+
+其次是流程八，应用日志条目到存储状态机时，etcd后端key-value存储引擎是boltdb。它是一个基于B+ tree实现的存储引擎，当写入数据，提交事务时，它会将dirty page持久化存储到磁盘中。在这过程中boltdb会产生磁盘随机IO写入，因此事务提交性能依赖磁盘IO随机写入性能
+
+最后在整个写流程中，etcd节点的CPU、内存、网络带宽资源应充足，否则肯定也会影响性能
+
+etcd问题定位过程中常用的工具如下图所示
+
+![工具](./images/delay_2.png)
+
+### 网络
+
+在etcd中，各个节点之间需要通过2380端口相互通信，以完成Leader选举、日志同步等功能，因此底层网络质量（吞吐量、延时、稳定性）对上层etcd服务的性能有显著影响
+
+网络资源出现异常的常见表现是连接闪断、延时抖动、丢包等
+
+一方面，可以使用常规的ping/traceroute/mtr、ethtool、ifconfig/ip、netstat、tcpdump网络分析工具等命令，测试网络的连通性、延时，查看网卡的速率是否存在丢包等错误，确认etcd进程的连接状态及数量是否合理，抓取etcd报文分析等
+
+另一方面，etcd应用层提供了节点之间网络统计的metrics指标，分别如下：
+
+- etcd_network_active_peer，表示peer之间活跃的连接数；
+
+- etcd_network_peer_round_trip_time_seconds，表示peer之间RTT延时；
+
+- etcd_network_peer_sent_failures_total，表示发送给peer的失败消息数；
+
+- etcd_network_client_grpc_sent_bytes_total，表示server发送给client的总字节数，通过这个指标我们可以监控etcd出流量；
+
+- etcd_network_client_grpc_received_bytes_total，表示server收到client发送的总字节数，通过这个指标可以监控etcd入流量
+
+etcd metrics指标名由namespace和subsystem、name组成。namespace为etcd，subsystem是模块名（比如network、name具体的指标名）可以在Prometheus里搜索etcd_network找到所有network相关的metrics指标名
+
+一方面，expensive request中的大包查询会使网卡出现瓶颈，产生丢包等错误，从而导致etcd吞吐量下降、高延时。expensive request导致网卡丢包，出现超时，这在etcd中是非常典型且易发生的问题，它主要是因为业务没有遵循最佳实践，查询了大量key-value
+
+另一方面，在跨故障域部署的时候，故障域可能是可用区、城市。故障域越大，容灾级别越高，但各个节点之间的RTT越高，请求的延时更高
+
+### 磁盘IO
+
+在etcd中无论是Raft日志持久化还是boltdb事务提交，都依赖于磁盘I/O的性能
+
+当etcd请求延时出现波动时，首先关注disk相关指标是否正常。我们可以通过etcd磁盘相关的metrics(etcd_disk_wal_fsync_duration_seconds和etcd_disk_backend_commit_duration_seconds)来观测应用层数据写入磁盘的性能
+
+etcd_disk_wal_fsync_duration_seconds（简称disk_wal_fsync）表示WAL日志持久化的fsync系统调用延时数据。一般本地SSD盘P99延时在10ms内，如下图所示。
+
+![磁盘IO](./images/delay_3.png)
+
+etcd_disk_backend_commit_duration_seconds（简称disk_backend_commit）表示后端boltdb事务提交的延时，一般P99在120ms内
+
+![磁盘IO](./images/delay_4.png)
+
+需要注意的是，一般监控显示的磁盘延时都是P99，但实际上etcd对磁盘特别敏感，一次磁盘I/O波动就可能产生Leader切换。如果遇到集群Leader出现切换、请求超时，但是磁盘指标监控显示正常，可以查看P100确认下是不是由于磁盘I/O波动导致的
+
+同时etcd的WAL模块在fdatasync操作超过1秒时，也会在etcd中打印如下的日志，也可以结合日志进一步定位
+
+```go
+if took > warnSyncDuration {
+   if w.lg != nil {
+      w.lg.Warn(
+         "slow fdatasync",
+         zap.Duration("took", took),
+         zap.Duration("expected-duration", warnSyncDuration),
+      )
+   } else {
+      plog.Warningf("sync duration of %v, expected less than %v", took, warnSyncDuration)
+   }
+}
+```
+
+当disk_wal_fsync指标异常的时候，一般是底层硬件出现瓶颈或异常导致。当然也有可能是CPU高负载、cgroup blkio限制导致的
+
+可以通过iostat、blktrace工具分析瓶颈是在应用层还是内核层、硬件层。其中blktrace是blkio层的磁盘I/O分析利器，可记录IO进入通用块层、IO请求生成插入请求队列、IO请求分发到设备驱动、设备驱动处理完成这一系列操作的时间，帮助发现磁盘I/O瓶颈发生的阶段
+
+当disk_backend_commit指标的异常时候，说明事务提交过程中的B+ tree树重平衡、分裂、持久化dirty page、持久化meta page等操作耗费了大量时间
+
+若disk_backend_commit较高、disk_wal_fsync却正常，说明瓶颈可能并非来自磁盘I/O性能，也许是B+ tree的重平衡、分裂过程中的较高时间复杂度逻辑操作导致。比如etcd目前所有stable版本，从freelist中申请和回收若干连续空闲页的时间复杂度是O(N)，当db文件较大、空闲页碎片化分布的时候，则可能导致事务提交高延时
+
+etcd还提供了disk_backend_commit_rebalance_duration和disk_backend_commit_spill_duration两个metrics，分别表示事务提交过程中B+ tree的重平衡和分裂操作耗时分布区间
+
+disk_wal_fsync记录的是WAL文件顺序写入的持久化时间，disk_backend_commit记录的是整个事务提交的耗时。后者涉及的磁盘I/O是随机的，为了保证etcd集群的稳定性，建议使用SSD磁盘以确保事务提交的稳定性
+
+### expensive request
+如果磁盘和网络指标都很正常，那么延迟高还有可能是expensive request导致的
+
+一个读写请求经过Raft模块处理后，最终会走到MVCC模块。在kubernetes中，当集群Pod较多的时候，如果频繁执行List Pod，可能会导致etcd出现大量的「apply request took too long」警告日志
+
+对于etcd而言，List Pod请求涉及到大量的key查询，会消耗较多的CPU、内存、网络资源，此类expensive request的QPS如果较大，则很可能导致OOM、丢包
+
+为了提高请求延时分布的可观测性、延时问题的定位效率等，etcd实现了trace特性，详细记录了一个请求在各个阶段的耗时。如果某阶段耗时流程默认的100ms，则会打印一条trace日志。通过trace特性就可以快速定位到高延时读写请求的原因
+
+如果开启了密码鉴权，在连接数量增多、QPS增大后，如果突然出现请求超时，如何确定是鉴权还是查询、更新接口导致的呢？
+
+etcd默认参数并不会采集各个接口的延时数据，可以通过设置etcd的启动参数`-metrics`为expensive来开启，获取每个gRPC接口的延时数据。同时可结合各个gRPC接口的请求数，获得QPS
+
+### 集群容量、节点CPU/Memory瓶颈
+
+如果网络、磁盘IO正常，也没有expensive request，也有可能导致高延时请求😂
+
+首先还是去看trace日志，通过etcd_server_slow_apply_total指标，观察其值快速增长的时间点与高延时请求产生的日志时间点是否吻合
+
+其次检查是否存在大量写请求。线性读需确保本节点数据与Leader数据一样新，如果本节点的数据与Leader差异较大，本节点追赶Leader数据过程会花费一定时间，最终导致高延时的线性读请求产生
+
+**etcd适合读多写少的业务场景，如果写请求较大，很容易出现容量瓶颈，导致高延时的读写请求产生**
+
+最后通过ps/top/mpstat/perf等CPU、Memory性能分析工具，检查etcd节点是否存在CPU、Memory瓶颈。goroutine饥饿、内存不足都会导致高延时请求产生，如果确定CPU和Memory存在异常，可以通过开启debug模式，通过pprof分析CPU和内存瓶颈点
