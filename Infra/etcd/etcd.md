@@ -1283,3 +1283,251 @@ etcd默认参数并不会采集各个接口的延时数据，可以通过设置e
 **etcd适合读多写少的业务场景，如果写请求较大，很容易出现容量瓶颈，导致高延时的读写请求产生**
 
 最后通过ps/top/mpstat/perf等CPU、Memory性能分析工具，检查etcd节点是否存在CPU、Memory瓶颈。goroutine饥饿、内存不足都会导致高延时请求产生，如果确定CPU和Memory存在异常，可以通过开启debug模式，通过pprof分析CPU和内存瓶颈点
+
+## 为啥etcd内存占用很高？
+
+如果遇到etcd内存占用较高的情况，第一反应: **重启etcd进程** 以及 **开启etcd debug模式**，重启etcd进程等复现，然后采集heap profile分析内存占用
+
+### 分析整体思路
+
+以etcd写请求流程为例，总结可能导致etcd内存占用较高的核心模块与其数据结构
+
+![memory_1](./images/memory_1.png)
+
+当etcd收到一个写请求后，gRPC Server会先建立连接。连接数量越多，会导致etcd进程的fd、goroutine等资源上涨，因此会占用越来越多内存
+
+etcd需要将此请求的日志条目保存在raftLog里面。etcd raftLog后端实现是内存存储，核心就是数组。因此raftLog使用的内存与其保存的日志条目成正比，它也是内存分析过程中最容易被忽略的一个数据结构
+
+当日志条目被集群多数节点确认后，在应用到状态机的过程中，会在内存treeIndex模块的B-tree中创建、更新key与版本号信息。在这过程中treeIndex模块的B-tree使用的内存与key、历史版本数量成正比
+
+更新完treeIndex模块的索引信息后，etcd将key-value数据持久化存储到boltdb。boltdb使用了mmap技术，将db文件映射到操作系统内存中。因此在未触发操作系统将db对应的内存page换出的情况下，etcd的db文件越大，使用的内存也就越大
+
+一方面，其他client可能会创建若干watcher、监听这个写请求涉及的key， etcd也需要使用一定的内存维护watcher、推送key变化监听的事件
+
+另一方面，如果这个写请求的key还关联了Lease，Lease模块会在内存中使用数据结构Heap来快速淘汰过期的Lease，因此Heap也是一个占用一定内存的数据结构
+
+最后，不仅仅是写请求流程会占用内存，读请求本身也会导致内存上升。尤其是expensive request，当产生大包查询时，MVCC模块需要使用内存保存查询的结果，很容易导致内存突增
+
+### 一个key使用数G内存案例
+
+首先，本机还没有安装Prometheus和Grafana，没可视化看着不太好。先安装这俩
+
+```zsh
+brew install prometheus
+
+brew install grafana
+
+# 修改prometheus的配置文件，添加etcd的metrics
+vim /opt/homebrew/etc/prometheus.yml
+
+- job_name: 'etcd'
+  scrape_interval: 15s
+  static_configs:
+    - targets: ['localhost:2379']
+
+# 启动
+brew services start prometheus
+brew services start grafana
+
+# 直接访问 http://localhost:3000 ，登录用户名密码都是admin
+```
+
+登录Grafana之后，添加etcd的datasource，然后添加dashboard，选择etcd的模板，就可以看到etcd的metrics了，如下图所示
+
+![memory_2](./images/memory_2.png)
+
+先put同一个key 1000次（之前put不同的key1000次了）
+
+```bash
+for i in {1..1000}; do
+  echo "第 $i 次 put..."
+  dd if=/dev/urandom bs=1024 count=1024 | etcdctl put key && echo "第 $i 次成功" || { echo "失败"; break; }
+done
+```
+
+执行到第187次就失败了😅，原因是当前下载的是最新官方release（3.6.7），没细看，实际上安装的不是arm64而是amd64😅
+
+![memory_3](./images/memory_3.png)
+
+![memory_5](./images/memory_5.png)
+
+直接把/tmp下的etcd和etcdctl相关文件删除干净，然后`brew install etcd`，完事
+
+Grafana上看DB Size
+
+![memory_4](./images/memory_4.png)
+
+重新执行，1000条全部插入成功
+
+DB Size如下图所示
+
+![memory_6](./images/memory_6.png)
+
+Etcd Process Memory如下图所示，内存峰值给干到2G（单个节点）了
+
+![memory_7](./images/memory_7.png)
+
+之后获取最新revision，并压缩
+
+```bash
+etcdctl compact `(etcdctl endpoint status --write-out="json" | egrep -o '"revision":[0-9]*' | egrep -o '[0-9].*')`
+```
+
+压缩成功（之前put不同的key1000次了）
+
+![memory_8](./images/memory_8.png)
+
+压缩后dbsize明显降低，但是内存占用还是很高
+
+![memory_9](./images/memory_9.png)
+
+再对集群所有节点进行碎片整理
+
+```bash
+etcdctl defrag --cluster
+```
+
+![memory_10](./images/memory_10.png)
+
+可以看到db Size还可以再降，但是内存还多了一点
+
+**「那么为什么刚才只对1个key做1000次put，etcd占用了这么多内存？」**
+
+#### raftLog
+
+当发起一个请求时，etcd需通过Raft模块将此请求同步到其他节点，详细流程如下所示
+
+![memory_11](./images/memory_11.png)
+
+Raft模块的输入是一个消息/Msg，输出统一为Ready结构。etcd会把此请求封装成一个消息，提交到Raft模块
+
+Raft模块收到请求后，会把此消息追加到raftLog的unstable存储的entry内存数组中（流程2），并且将待持久化的此消息封装到Ready结构内，通过管道通知到etcdserver（流程3）
+
+etcdserver取出消息，持久化到WAL中，并追加到raftLog的内存存储storage的entry数组中（流程5）
+
+raftLog的核心数据结构，如下所示。其是由storage、unstable、committed、applied等组成。storage存储已经持久化到WAL中的日志条目，unstable存储未持久化的条目和快照，一旦持久化会及时删除日志条目，因此不存在内存占用的问题
+
+```go
+type raftLog struct {
+	storage Storage
+
+	unstable unstable
+
+	committed uint64
+
+	applied uint64
+}
+```
+
+存储稳定的日志条目的storage类型是Storage，Storage定义了存储Raft日志条目的核心API接口，业务应用层可根据实际场景进行定制化实现。etcd使用的Raft算法库本身提供的MemoryStorage，其定义如下，核心是使用了一个数组来存储已经持久化后的日志条目
+
+```go
+type MemoryStorage struct {
+	sync.Mutex
+
+	hardState pb.HardState
+	snapshot pb.Snapshot
+
+	ents []pb.Entry
+}
+```
+
+随着写请求增多，内存中保留的Raft日志条目会越来越多，为了防止etcd出现OOM，etcd提供了「快照」和「压缩」功能来解决这个问题
+
+可以通过调整`-snapshot-count`参数来控制生成快照的频率，其值默认值为100000，也就是每10万个写请求触发一次快照生成操作
+
+快照生成完之后，etcd会通过压缩来删除旧的日志条目。etcd会保留一部分Raft日志条目，数量由DefaultSnapshotCatchUpEntries参数控制，默认是5000（当前依然不支持自定义配置）
+
+保留一小部分日志条目其实是为了帮助慢的Follower以较低的开销向Leader获取Raft日志条目，以尽快追上Leader进度。如果过raftLog中不保留任何日志条目，就只能发送快照给慢的Follower，这样开销非常大
+
+#### treeIndex
+
+一个put写请求的日志条目被集群多数节点确认提交后，这时候etcdserver就会从Raft模块获取已提交的日志条目，应用到MVCC模块的treeIndex和boltdb
+
+treeIndex是基于google内存btree库实现的一个索引管理模块，在etcd中每个key都会在treeIndex中保存一个索引项（keyIndex），记录key和版本号等信息
+
+```go
+type keyIndex struct {
+	key 		[]byte
+	modified 	revision
+	generations []generation
+}
+```
+
+每次对key的修改、删除操作都会在key的索引项中追加一条修改记录（revision）清理旧版本，防止内存占用过多的方式还是「压缩」，当执行compact命令时，etcd会遍历treeIndex中的各个keyIndex，清理历史版本号记录与已删除的key，释放内存
+
+#### boltdb
+
+在treeIndex模块中创建、更新完keyIndex数据结构后，key-value结构、各种版本号、lease等相关信息会保存到如下的一个 mvccpb.keyValue 结构体中。它是boltdb的value，key则是treeIndex中保存的版本号
+
+```go
+kv := mvccpb.KeyValue{
+	Key: key,
+	Value: value,
+	CreateRevision: c,
+	ModRevision: rev,
+	Version: ver,
+	Lease: int64(leaseID),
+}
+```
+
+etcd在启动时会通过mmap机制，将etcd db文件映射到etcd进程地址空间，并设置mmap的MAP_POPULATE flag，它会告诉Linux内核预读文件，让Linux内核将文件内容拷贝到物理内存中
+
+在节点内存充足的情况下，后续读请求可直接从内存中获取。相比read系统调用，mmap少一次从page cache拷贝到进程内存地址空间的操作，因此具备更高的性能
+
+如果etcd节点内存不足，那么可能导致db文件对应的内存页被换出。当读请求命中的页未在内存中时，就会产生缺页中断，导致读过程中产生磁盘IO。这样虽然避免了etcd OOM，但是会降低读写性能
+
+#### watcher
+
+当创建一个watcher时，client与server建立连接后，会创建一个gRPC Watch Stream，随后通过gRPC Watch Stream发送创建watcher请求。每个gRPC Watch Stream中的etcd WatchServer会分配两个goroutine处理，一个是sendLoop，它负责Watch事件的推送。一个是recvLoop，它负责接收client的创建、取消watcher请求信息
+
+因为watch监听机制耗费的内存跟client连接数、gRPC Stream、watcher数量（watching）有关
+
+- c1表示每个连接耗费的内存
+- c2表示每个gRPC Stream耗费的内存
+- c3表示每个watcher耗费的内存
+
+```text
+memory = c1 * number_of_conn + c2 * avg_number_of_stream_per_conn + c3 * avg_number_of_watch_stream
+```
+
+根据etcd社区的压测报告
+
+- 每个client连接消耗大概 17kb （c1）
+- 每个gRPC Stream消耗大概 18kb （c2）
+- 每个watcher消耗大概 350个字节 （c3）
+
+变更事件较多，服务端、客户端高负载，网络阻塞等情况都可能导致事件堆积
+
+在etcd 3.6.7版本中，每个watcher默认buffer是1024。buffer内保存watch响应结果，如watchID、watch事件（watch事件包含key、value）等
+
+若大量事件堆积，将产生较高昂的内存的开销。可以通过etcd_debugging_mvcc_pending_events_total指标监控堆积的事件数，etcd_debugging_slow_watcher_total指标监控慢的watcher数，来及时发现异常
+
+#### expensive request
+
+如果写入较大的key-value后，如果client频繁查询它，也会产生高昂的内存开销。count-only、limit查询在key百万级以上时，会产生非常大的内存开销。因为在遍历treeIndex的过程中，会将相关key保存在数组里面，当key数量较多时，会占用大量内存
+
+「这时候如何减少内存占用？」
+
+**不重启etcd的情况下，无法完全强制释放所有内存**
+
+1. 多次defrag
+	- defrag是 COW 重建文件，每次都能进一步回收残留freelist和fragmentation
+
+```bash
+for i in {1..5}; do  # 重复 3-5 次
+  etcdctl defrag
+  echo "第 $i 次 defrag 完成，检查内存..."
+  sleep 10  # 等 OS reclaim
+done
+```
+
+2. 触发compact到最新的revision
+
+```bash
+REV=$(etcdctl endpoint status -w json | grep revision | head -1 | cut -d '"' -f8)
+etcdctl compact $REV  # 或 $((REV-1)) 保留最新
+etcdctl defrag
+```
+
+3. 等待自然GC和OS reclaim
