@@ -1531,3 +1531,219 @@ etcdctl defrag
 ```
 
 3. 等待自然GC和OS reclaim
+
+## 如何优化以及扩展etcd性能？
+
+etcd社区线性度压测结果可以达到14w/s，在实际业务场景中有时却只有几千，甚至几百、几十，还会偶尔出现超时、频繁抖动
+
+### 提升读性能
+
+如果说读性能差，其实本质是读请求链路中某些环节出现了瓶颈
+
+#### 性能分析链路
+
+![read_1](./images/rperf_1.png)
+
+#### 负载均衡
+
+建议通过 Load Balancer 访问后端etcd集群。一方面Load Balancer一般支持配置各种负载均衡算法，如连接数、Round-robin等，可以使集群负载更加均衡，规避etcd client早期的固定连接缺陷，获得集群最佳性能。另一方便，当集群节点需要替换、扩展集群节点的时候，不需要去调整各个cleint访问server的节点配置
+
+#### 合适的鉴权
+
+client通过负载均衡算法为请求选好etcd server节点后，client就可调用server的Range RPC方法，把请求发送给etcd server。在此过程中，如果server启用了鉴权，那么就会返回无权限相关错误给client
+
+如果server使用的是密码鉴权，在创建client时，需指定用户名和密码。etcd clientv3
+库发现用户名、密码非空，就会先校验用户名和密码是否正确
+
+client是通过向Server发送Authenticate RPC鉴权请求实现密码认证的，也就是路程2
+
+server节点收到鉴权请求后，会从boltdb获取此用户密码对应的算法版本、salt、cost值，并基于用户的请求明文密码计算出了一个hash值
+
+在得到hash值后，就可以对比db里保存的hash密码是否与其一致了。如果一致，就会返回一个token给client。这个token是client访问server节点的通行证，后续server只需要校验「通行证」是否有效即可，无需每次发起昂贵的 Authenticate RPC请求
+
+如果业务在访问etcd的过程中没有「复用」token，每次访问etcd都发起一次Authenticate调用，这将是一个非常大的性能瓶颈和隐患
+
+**这个Authenticate接口究竟有多慢呢？**
+
+- 压测集群etcd节点配置是16C32G
+- 压测方式是通过修改etcd clientv3库、benchmark工具，使benchmark工具支持Authenticate接口压测
+- 设置不同的client和connection参数，运行多次，观察结果是否稳定，获取测试结果
+
+![read_2](./images/rperf_2.png)
+
+也就是说 3.4 之前，Authenticate接口性能不到16QPS，并且随着client和connection增多，该性能会继续恶化。当client和conneciton的数量达到200个的时候，性能会下降到8QPS，P99延时为18秒，如上图所示
+
+由于导致Authenticate接口性能差的核心瓶颈，是在于密码鉴权使用了bcrpt计算hash值，因此Authenticate性能已接近极限
+
+并且，Authenticate的调用是由clientv3库默默发起的，etcd中也没有任何日志记录其耗时等
+
+为了能够快速发现Authenticate等特殊类型的expensive request，可以通过gPRC拦截器机制（当前社区依然没有实现该功能），当一个请求超过300ms或其他时间，就会打印整个请求信息。但是可以启动`--debug`或者环境变量（ETCD_DEBUG），会打印每个gRPC请求的详细调试信息，etcd有硬编码的慢请求检测（通常阈值在100ms~1s固定编码），当请求处理时间过长时，会自动打印警告日志，如「request took too long to execute」或「slow apply」
+
+从 v3.4 开始，etcd完全重设计了 v3 auth 系统
+
+- 密码验证移到了gPRC API层，可以**并行处理（多个goroutine）**，不再是单线程瓶颈
+- 直接解决了早期串行执行的问题，性能大幅提升
+- 后续版本 3.5 3.6 虽然无针对 auth 的专用大优化，但继承了这一设计，并有整体稳定性、性能修复
+
+**建议**
+
+1. 如果生产环境中需要开启鉴权，并且读写QPS较大，那么建议不要图省事使用密码鉴权。最好使用证书鉴权，这样能完美避坑认证性能差、token过期等问题，性能几乎无损失
+
+2. 确保业务每次发起请求时都能「复用」token，避免每次访问etcd都发起Authenticate RPC调用
+
+3. 如果使用密码鉴权时遇到性能瓶颈问题，那就升级到最新稳定版本，能适当提升点性能
+
+#### 合适的读模式
+
+client通过server的鉴权后，就可以发起读请求调用了，也就是最上面图中的流程3
+
+读模式对性能有着至关重要的影响。etcd提供「串行读」和「线性读」两种读模式。前者因为不经过ReadIndex模块，具有低延时、高吞吐量的特点；后者在牺牲一点延时和吞吐量的基础上，实现了数据的强一致性读
+
+关于串行读和线性读的性能区别
+
+测试环境:
+
+- 机器配置client 16核32G，三个Server节点8核16G、SSD盘，client与server都在同一可用区
+- 各节点之间RTT在0.1ms到0.2ms之间
+- etcd v3.4
+- 1000个client
+
+```bash
+# 串行读
+benchmark --endpoints=addr --conns=100 --clients=1000 \
+range hello --consistency=s --total=500000
+
+# 线性读
+benchmark --endpoints=addr --conns=100 --clients=1000 \
+range hello --consistency=l --total=500000
+```
+
+串行读压测结果如下所示，32w QPS，平均延时 2.5ms
+
+![read_3](./images/rperf_3.png)
+
+线性读压测结果如下所示，19w QPS，平均延时 4.9ms
+
+![read_4](./images/rperf_4.png)
+
+从两个压测结果图中可以看出，在100个连接时，串行读性能比线性读性能高11w/s，串行读请求延时比线性读请求延时低一半
+
+**需要注意的是，以上读性能数据是在1个key、没有任何写请求、同可用区的场景下压测出来的，实际的读性能会随着写请求增多而出现显著下降，这也是实际业务场景性能与社区压测结果存在非常大差距的原因之一**
+
+所以，自己用etcd benchmark工具在当前etcd集群环境中自测一下，也可以参考下面的etcd社区压测结果
+
+![read_5](./images/rperf_5.png)
+
+如果业务场景读QPS较大，但是又不想通过etcd proxy等机制来扩展性能，那么可以进一步评估业务场景对数据一致性的要求高不高。如果可以容忍短暂的不一致，那可以通过串行读来提升etcd的读性能，也可以部署Learner节点给可能会产生expensive read request的业务使用，实现cheap/expensive read request 的隔离
+
+#### 线性读实现机制、网络延时
+
+etcd中默认读请求是线性读模式。线性读对应图中的流程4、流程5，其中流程4对应的ReadIndex，流程5对应的是等待本节点数据追上Leader的进度
+
+在早期的etcd 3.0版本中，etcd线性读是基于Raft log read实现的。每次读请求要像写请求一样，生成一个Raft日志条目，然后提交给Raft一致性模块处理，基于Raft日志执行的有序性来实现线性读。因为该过程需要经过磁盘I/O，所以性能较差
+
+为了解决Raft log read的线性读性能瓶颈，etcd 3.1中引入了ReadIndex。ReadIndex仅涉及到各个节点之间网络通信，因此节点之间的RTT延时对其性能有较大影响。虽然同可用区可获取到最佳性能，但是存在单可用区故障风险。如果你想实现高可用区容灾的话，那就必须牺牲一点性能了
+
+跨可用区部署时，各个可用区之间延时一般在2毫秒内。如果跨城部署，服务性能就会下降较大。所以一般场景下不建议跨城部署，可以通过Learner节点实现异地容灾。如果异地的服务对数据一致性要求不高，那么甚至可以通过串行读访问Learner节点，来实现就近访问，低延时
+
+各个节点之间的RTT延时，是决定流程四ReadIndex性能的核心因素之一
+
+#### 磁盘IO性能、写QPS
+
+到了流程5，影响性能的核心因素就是磁盘IO延时和写QPS
+
+流程5是指节点从Leader获取到最新已提交的日志条目索引（rs.Index）后，它需要等待本节点当前已应用的Raft日志索引，大于等于Leader的已提交索引，确保能在本节点状态机中读取到最新数据
+
+```go
+if ai := s.getAppliedIndex(); ai < rs.Index {
+	select {
+		case <- s.applyWait.Wait(rs.Index):
+		case <- s.stopping:
+			return
+	}
+}
+
+nr.notify(nil)
+```
+
+应用已提交日志条目到状态机的过程又涉及到随机写磁盘
+
+**etcd是一个对磁盘IO性能非常敏感的存储系统，磁盘IO性能不仅会影响Leader稳定性、写性能表现，还会影响读性能。线性读性能会随着写性能的增加而快速下降。如果业务对性能、稳定性有较大要求，那么尽量使用SSD盘**
+
+下表是一个8C16G的三节点集群，在总key数只有一个的情况下，随着写请求增大，线性读性能下降的趋势总结（基于benchmark工具压测结果）
+
+![read_6](./images/rperf_6.png)
+
+当本节点已应用日志条目索引大于等于Leader已提交的日志条目索引后，读请求就会接到通知，就可通过MVCC模块获取数据
+
+#### RBAC规则数、Auth锁
+
+读请求到了MVCC模块后，首先要通过鉴权模块判断此用户是否有权限访问请求的数据路径，也就是流程6。影响流程6的性能因素是RBAC规则数和锁
+
+首先是RBAC规则数，为了解决快速判断用户对指定key范围是否有权限，etcd为每个用户维护了读写权限区间树。基于区间树判断用户访问的范围是否在用户的读写权限区间内，时间复杂度仅需要O(logN)
+
+另外一个因素则是AuthStore的锁。在etcd 3.4.9之前的，使用较粗粒度的锁（mutex），密码校验（bcrypt）等操作会长时间持有锁，导致Authenticate、AuthEnable等授权相关接口并发时严重阻塞，性能崩盘。3.4之后密码校验完全移到gPRC API层，多goroutine并行处理，不再串行持锁
+
+#### expensive request、treeIndex锁
+
+通过流程6的授权后，则进入流程7，从treeIndex中获取整个查询涉及的key列表版本号信息。在这个流程中，影响其性能的关键因素是treeIdnex的总key数、查询的key数、获取treeIndex锁的耗时
+
+首先，treeIndex中总key数过多会适当增大我们遍历的耗时
+
+其次，若要访问treeIndex我们必须获取到锁，但是可能其他请求如compact操作也会获取锁。早期的时候，它需要遍历所有索引，然后进行数据压缩工作。这就会导致其他请求阻塞，进而增大延时
+
+为了解决这个性能问题，优化方案是compact的时候会将treeIndex克隆一份，以空间来换时间，尽量降低锁阻塞带来的超时问题
+
+**查询key数较多等expensive read request时对性能的影响**
+
+假设我们链路分析图中的请求是查询一个Kubernetes集群所有Pod，当Pod数一百以内的时候可能对etcd影响不大，但是当你Pod数千甚至上万的时候， 流程7、8就会遍历大量的key，导致请求耗时突增、内存上涨、性能急剧下降
+
+如果业务就是有这种expensive read request逻辑，该如何应对呢？
+
+首先我们可以尽量减少expensive read request次数，在程序启动的时候，只List一次全量数据，然后通过etcd Watch机制去获取增量变更数据。比如Kubernetes的Informer机制，就是典型的优化实践
+
+其次，在设计上评估是否能进行一些数据分片、拆分等，不同场景使用不同的etcd prefix前缀。比如在Kubernetes中，不要把Pod全部都部署在default命名空间下，尽量根据业务场景按命名空间拆分部署。即便每个场景全量拉取，也只需要遍历自己命名空间下的资源，数据量上将下降一个数量级
+
+再次，如果觉得Watch改造大、数据也无法分片，开发麻烦，你可以通过分页机制按批拉取，尽量减少一次性拉取数万条数据
+
+最后，如果以上方式都不起作用的话，还可以通过引入cache实现缓存expensive read request的结果，不过应用需维护缓存数据与etcd的一致性
+
+#### 大key-value
+
+从流程7获取到key列表以及版本号信息后，就可以访问boltdb模块，获取key-value信息。在这个流程中，影响其性能表现的，除了上面介绍的expensive read request，还有大key-value和锁
+
+首先是大key-value。etcd设计上定位是个小型的元数据存储，它**没有数据分片机制**，默认db quota只有2G，实践中往往不会超过8G，并且针对每个key-value大小也有限制，默认是1.5MB
+
+大key-value非常容易导致etcd OOM、server节点出现丢包、性能急剧下降等
+
+那么当我们往etcd集群写入一个1MB的key-value时，它的线性读性能会从17wQPS下降到多少呢
+
+```bash
+benchmark --endpoints=addr --conns=100 --clients=1000 \
+range key --consistency=l --total=10000
+```
+
+执行的时候出现了「假死」情况
+
+![read_8](./images/rperf_8.png)
+
+测小规模、读操作没有问题，很快出结果
+
+```bash
+benchmark --endpoints=http://127.0.0.1:2379 --conns=10 --clients=100 put --sequential --key-size=8 --val-size=256 --total=10000
+```
+
+![read_9](./images/rperf_9.png)
+
+基本就是 etcd 写慢导致的「尾部卡死」。本地 Mac 压测写操作很难打出高 QPS（社区 14w 是 Linux 高配 SSD），属于正常现象，重跑一次就好了
+
+得到结果如下所示，读取一个1MB的key-value，线性读性能QPS下降到2976，平均延时上升到322ms
+
+![read_10](./images/rperf_10.png)
+
+从Grafana的监控图中可以看到，内存会出现突增，如果存在大量大key-value时，etcd内存暴涨，大概率OOM
+
+![read_11](./images/rperf_11.png)
+
+### 提升写性能
+
