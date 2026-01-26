@@ -1747,3 +1747,194 @@ benchmark --endpoints=http://127.0.0.1:2379 --conns=10 --clients=100 put --seque
 
 ### 提升写性能
 
+当使用etcd写入大量key-value数据的时候，有可能会遇到etcd server返回「etcdserver: too many requests」错误
+
+#### 性能分析链路
+
+![write_1](./images/wperf_1.png)
+
+#### db quota
+
+首先是流程一，etcd client会通过clientv3库的Round-robin负载均衡算法，从endpoint列表中轮训选择一个endpoint访问，发起gRPC调用
+
+然后进入流程二，etcd收到gRPC写请求后，首先经过的是Quota模块，它会影响写请求的稳定性，如果db大小超过配额就无法写入
+
+etcd是个小型的元数据存储，默认db quota大小是2G，超过2G就只读无法写入。所以需要根据业务场景，适当调整db quota大小，并配置合适的压缩策略
+
+etcd支持按时间周期性压缩、按版本号压缩两种策略，建议压缩策略不要配置得过于频繁。如果按时间周期压缩，一般情况下5分钟以上压缩一次比较合适，因为压缩过程中会加一系列锁和删除boltdb数据，过于频繁的压缩会对性能有一定影响
+
+一般情况下db大小尽量不要超过8G，过大的db文件和数据量对集群稳定性各方面都有一定的影响
+
+#### 限速
+
+通过流程二的Quota模块之后，请求会进入到流程三，KVServer模块。在这个模块里，影响写性能的核心因素是限速
+
+KVServer模块的写请求在提交Raft模块前，会进行限速判断。如果Raft模块已提交的日志索引（committed index）比已应用到状态机的日志索引（applied index）超过了5000，那么它就会返回一个「etcdserver: too many requests」错误给client
+
+哪些情况会导致committed Index远大于applied Index呢？
+
+1. long expensive read request导致写阻塞（3.4之前长读持有buffer读锁的问题），当前最新版本已经大大缓解，从3.4开始，通过引入**Raft read index**机制优化了linearizable read的实现，读请求不再需要长时间持有锁来等待 apply，而是通过 leader 的 commit index 快速确认读点，避免了旧版本中长读（例如大 range 查询）升级锁阻塞写的严重问题。现在 linearizable read 主要依赖 quorum 共识，而不直接阻塞写路径。expensive read 仍可能消耗 CPU/内存影响整体性能，但不会像旧版本那样直接导致写事务超时和大量 apply lag。etcd 还支持 serializable read（stale read）来进一步卸载 leader 压力。如果集群使用大量 linearizable read，且有极端的超大 range 查询，仍可能间接影响 apply 速率，但远不如 3.4 前严重。
+
+2. etcd定时批量将boltdb写事务提交的时候，需要对B+ tree进行重平衡、分裂，并将freelist、dirty page、meta page持久化到磁盘。此过程需要持有boltdb事务锁，如果磁盘随机写性能较差、瞬间大量写入，则也容易写阻塞，应用已提交的日志条目缓慢
+
+3. 执行defrag等运维操作时，也会导致写阻塞，它们会持有相关锁，导致写性能下降
+
+#### 心跳及选举参数优化
+
+写请求经过KVServer模块后，则会提交到流程四的Raft模块。我们知道etcd写请求需要转发给Leader处理，因此影响此模块性能和稳定性的核心因素之一是集群Leader的稳定性
+
+那么如何判断Leader的稳定性呢？
+
+1. 在使用etcd过程中，很可能见到Leader发送心跳超时的警告日志，可以通过日志判断集群是否有频繁切换Leader的风险
+
+2. 可以通过etcd_server_leader_changes_seen_total metrics来观察已发生Leader切换的次数
+
+那么哪些因素会导致此日志产生以及发生Leader切换呢？
+
+etcd是基于Raft协议实现数据复制和高可用的，各个节点见会选出一个Leader，然后Leader将写请求同步给各个Follower节点。而Follower节点如何感知Leader异常，发起选举，正是依赖Leader的心跳机制
+
+在etcd中，Leader节点会根据heartbeat-interval参数（默认100ms）定时向Follower节点发送心跳。如果两次发送心跳间隔超过2*heartbeat-interval，就会打印警告日志。超过election timeout（默认1000ms），Follower节点就会发起一轮Leader选举
+
+那么哪些因素会导致心跳超时呢？
+
+1. 磁盘IO过慢。因为etcd从Raft的Ready结构获取到相关待提交日志条目后，它需要将此消息写入到WAl日志中持久化。可以通过观察etcd_wal_fsync_duration_seconds_bucket指标来确定写WAL日志的延时。如果延时较大，可以使用SSD硬盘解决
+
+2. CPU使用率过高和网络延时过大导致。CPU使用率较高可能导致发送心跳的goroutine出现饥饿。如果etcd集群跨地域部署，节点之间RTT延时大，可以能导致此问题
+
+如何调整心跳相关参数，以避免频繁Leader选举呢？
+
+etcd默认心跳间隔是100ms，较小的心跳间隔会导致发送频繁的消息，消耗CPU和网络资源。而较大的心跳间隔，又会导致检测到Leader故障不可用耗时过长，影响业务可用性。一般情况下，为了避免频繁Leader切换，建议可以根据实际部署环境、业务场景，将新条件间隔时间调整在100ms到400ms左右，选举超时时间要求至少是心跳间隔的10倍
+
+#### 网络和磁盘IO延时
+
+当集群Leader稳定后，就可以进入Raft日志同步流程
+
+假设收到写请求的节点就是Leader，写请求通过Propose接口提交到Raft模块后，Raft模块会输出一系列消息。etcd server的raftNode goroutine通过Raft模块的输出接口Ready，获取到待发送给Follower的日志条目追加消息和待持久化的日志条目
+
+raftNode goroutine首先通过HTTP协议将日志条目追加消息广播给各个Follower节点，也就是流程五
+
+流程五涉及到各个节点之间网络通信，因此节点之间RTT延时对其性能有较大影响。跨可用区、跨地域部署时性能会出现一定程度的下降，建议结合实际网络环境使用benchmark工具测试一下。etcd Raft网络模块在实现上，也会通过流式发送和pipeline等技术优化来降低延时、提高网络性能
+
+同时，raftNode goroutine也会将待持久化的日志条目追加到WAL中，它可以防止进程crash后数据丢失，也就是流程六。注意此过程需要同步等待数据持久化，因为磁盘顺序写性能决定着性能优异
+
+为了提升写吞吐量，etcd会将一批日志条目批量持久化到磁盘。etcd是个对磁盘IO非常敏感的服务，如果服务对性能、稳定性有较大要求，建议使用SSD盘
+
+那么使用SSD盘的集群和非SSD盘的etcd集群写性能差异有多大呢？
+
+```bash
+benchmark --endpoints=addr --conns=100 --clients=1000 \
+    put --key-size=8 --sequential-keys --total=10000000 --
+val-size=256
+```
+
+在本机上执行的结果，如下图所示
+
+![ssd](./images/wperf_2.png)
+
+只写了一半多，因为db大小超过quota了（默认2GB）
+
+![exceed](./images/wperf_4.png)
+
+```bash
+# 禁用quota
+etcd --quota-backend-bytes=0
+
+# 设置更大值
+etcd --quota-backend-bytes=50000000000
+```
+重启etcd生效
+
+第三方非SSD盘集群，执行同样的benchmark命令的压测结果，如下图所示
+
+![non-ssd](./images/wperf_3.png)
+
+测试完压缩的时候发现一个非常有意思的现象，如下图所示
+
+![eg](./images/wperf_5.png)
+
+手动直接输入revision来compact会出现deadline exceeded，通过管道的方式就不会
+
+gRPC调用默认deadline较短+server响应延迟，etcdctl基于clientv3的unary RPC（如compact）有默认context deadline。compact操作虽然是「异步触发」，但在**db文件很大**、**高残留负载**、**磁盘IO压力**时，server处理请求的初始化阶段（auth、proposal、raft commit）可能稍慢，超过client deadline，导致「context deadline excedded」
+
+后面的能成功，是因为先执行`endpoint status`这是一个轻量读操作，快速成功，返回当前revision。然后才执行compact，并且revision是**实时新鲜的当前revision（保证<=committed revision）**，避免任何潜在检查开销。同时shell在管道、子命令中顺序执行，先status成功建立了稳定连接（「热身」了gRPC channel），后续compact刚好赶上server响应窗口
+
+可以通过手动添加超时参数来可靠执行`--dial-timeout`、`--keepalive-time`、`--keepalive-timeout`
+
+记住**compact之后必defrag**，`etcdctl defrag`(直接dbsize从2G干到2M)
+
+#### 快照参数优化
+
+在Raft模块中，正常情况下，Leader可快速地将我们的key-value写请求同步给其他Follower节点。但是某Follower节点如果数据落后太多，Leader内存中的Raft日志已经被compact了，那么Leader只能发送一个快照给Follower节点重建恢复
+
+在快照较大的时候，发送快照可能会消耗大量的CPU、Memory、网络资源，那么它就会影响我们的读写性能，也就是图中的流程七
+
+一方面，etcd raft模块引入了流控机制，来解决日志同步过程中可能出现的大量资源开销、导致集群不稳定的问题
+
+另一方面，我们可以通过快照参数优化，去降低Follower节点通过Leader快照重建的概率，使其尽量能通过增量的日志同步保持集群的一致性
+
+etcd提供一个名为`-snapshot-count`的参数来控制快照行为。它是指收到多少个写请求后就触发一次快照，并对Raft日志条目进行压缩。为了帮助slower Follower赶上Leader进度，etcd在生成快照，压缩日志条目的时候也会至少保留5000条日志条目在内存中
+
+那snapshot-count参数设置多少比较合适？
+
+snapshot-count值过大会消耗较多内存，过小的话在某节点数据落后时，如果它请求同步的日志条目Leader已经压缩了，此时就不得不将整个db文件发送给落后节点，然后进行快照重建
+
+快照重建是及其昂贵的操作，对服务质量有较大影响。因此我们需要尽量避免快照重建。官方在 v3.6.0 发布公告中明确--snapshot-count降低默认值回 10000，理由是进一步控制内存/WAL 占用（高 snapshot-count 会让 leader 保留更多 log entry 在内存，增加 OOM 风险或 WAL 膨胀），并优化 follower 追赶效率。结果是保留的 history 更少，单个 snapshot 更小，更频繁但更轻量的 snapshot。
+
+#### 大value
+
+当写请求对应的日志条目被集群多数节点确认后，就可以提交到状态机执行了。etcd的raftNode goroutine就可通过Raft模块的输出接口Ready，获取到已提交的日志条目，然后提交到Apply模块的FIFO待执行队列。因为它是串行应用执行命令，任意请求在应用到状态机时阻塞都会导致写性能下降
+
+当Raft日志条目命令从FIFO队列取出执行后，它会首先通过授权模块校验是否有权限执行对应的写操作，对应图中的流程八。影响其性能因素是RBAC规则数和锁
+
+通过权限检查后，写事务则会从treeIndex模块中查找key、更新key版本号等信息，对应图中的流程九，影响其性能因素是key数和锁
+
+更新完索引之后，就可以把新版本号作为boltdb key，把用户key/value、版本号等信息组合成一个value，写入到boltdb，对应图的中流程十，影响其性能因素是大value、锁
+
+如果在应用中保存1Mb的value，这会对etcd稳定性带来哪些风险？
+
+1. 导致读性能大幅下降、内存突增、网络带宽资源出现瓶颈等。通过benchmark执行命令写入1MB数据的时候`benchmark --endpoints=http://127.0.0.1:2379 --conns=100 --clients=1000 put --key-size=8 --sequential-keys --total=500 --val-size=1024000`，集群（三节点8C16G，非SSD盘），事务提交P99延时高达4秒。将写入的key-value调整为100KB，P99会大幅下降，3、400ms左右
+
+2. etcd底层使用boltdb存储，它是一个基于COW（Copy-on-write）机制实现的嵌入式key-value数据库。较大的value频繁更新，因为boltdb的COW机制，会导致boltdb大小不断膨胀，很容易超过默认db quota值，导致无法写入
+
+那么如何优化呢？
+
+1. 如果业务已经使用了大key，拆分、改造存在一定客观的困难，那么就从问题的根源之一对症下药，尽量不要频繁更新大key，这个etcd db大小就不会快速膨胀
+
+2. 可以从业务场景考虑，判断频繁的更新是否合理，能否做到增量更新
+
+3. 如果写请求降低不了，就必须进行精简、拆分数据结构了。将需要频繁更新的数据查分成小key进行更新等，实现将value值控制在合理范围以内
+
+Kubernetes的Node心跳机制优化就是这块一个非常优秀的实践。早期kubelet会每隔10s上报心跳更新Node资源。但是此资源对象较大，导致db大小不断膨胀，无法支撑更大规模的集群。为了解决这个问题，社区做了数据拆分，将经常变更的数据拆分成非常细粒度的对象，实现了集群稳定性提升，支撑更大规模的k8s集群
+
+#### boltdb锁
+
+boltdb锁从互斥锁优化到读写锁，之后为了实现全并发读，去掉了buffer
+
+并发读特性的核心原理是创建读事务对象时，会全量拷贝当前写事务未提交的buffer数据，并发的读写事务不再阻塞在一个buffer资源锁上，实现了全并发读
+
+写事务也不再因为expensive read request长时间阻塞，有效降低了写请求的延时
+
+#### 扩展性能
+
+当然有不少业务场景即便用最高配的硬件配置，etcd可能还是无法解决所面临的性能问题。etcd社区也考虑到此问题，提供了一个名为`gRPC proxy`的组件，可以用来扩展读、扩展watch、扩展Lease性能的机制
+
+![gRPC-proxy](./images/wperf_6.png)
+
+**扩展读**
+
+如果client较多，etcd集群节点连接数量大于2w，或者想平行扩展串行读的性能，那么gRPC proxy就是一个良好的解决方案。它是个无状态节点，提供高性能的读缓存能力。可以根据业务场景需要水平扩容若干节点，同时通过连接复用，降低服务端连接数、负载
+
+它也提供了故障探测和自动切换能力，当后端etcd某个节点失效后，会自动切换到其他正常节点
+
+**扩展Watch**
+
+大量的watcher会显著增大etcd server的负载，导致读写性能下降。etcd为了解决这个问题，gRPC proxy组件里面提供了watcher合并的能力。如果多个client Watch同key或者范围（如上图三个client Watch同key）时，它会尝试将你的watcher进行合并，降低服务端的watcher数。
+
+然后当它收到etcd变更消息时，会根据每个client实际Watch的版本号，将增量的数据变更版本，分发给你的多个client，实现watch性能扩展及提升。
+
+**扩展Lease**
+
+etcd Lease特性，提供了一种客户端活性检测机制。为了确保key不被淘汰，client需要定时发送keepalive心跳给server。当Lease非常多时，这就会导致etcd服务端的负载增加。在这种场景下，gRPC proxy提供了keepalive心跳连接合并的机制，来降低服务端负载
+
+
+
