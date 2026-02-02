@@ -3143,3 +3143,243 @@ if werr != nil {
    m.hdr = hdr
 }
 ```
+
+## 解析etcd在API Gateway开源项目中的应用
+
+在软件开发过程中，为了提高代码的灵活性和开发效率，大量使用配置去控制程序的运行行为
+
+从简单的数据库账号密码配置，到[confd](https://github.com/kelseyhightower/confd)支持以etcd为后端存储的本地配置以及模板管理，再到[Apache-APISIX](https://github.com/apache/apisix)等API Gateway项目使用etcd存储服务配置、路由信息等，最后到Kubernetes更实现了Secret和ConfigMap资源对象来解决配置管理的问题
+
+### 服务发现
+
+#### 单体架构
+
+在早期软件开发时使用的是单体架构，也就是所有功能耦合在同一个项目中，统一构建、测试、发布。单体架构在项目刚启动的时候，架构简单、开发效率高，比较容易部署、测试。但随着项目不断增大，它具有若干缺点，比如:
+
+- 所有功能耦合在同一个项目中，修复一个小Bug就需要发布整个大工程项目，增大引入问题风险。同时随着开发人员增多、单体项目的代码增长、各模块堆砌在一起、代码质量参差不齐，内部复杂度会越来越高，可维护性差
+
+- 无法按需针对仅出现瓶颈的功能模块进行弹性伸缩，只能作为一个整体继续扩展，因此扩展性较差
+
+- 一旦单体应用宕机，将导致所有服务不可用，因此可用性较差
+
+#### 分布式及微服务架构
+
+如何解决以上痛点呢？
+
+当然是将单体应用进行拆分，大而化小。如何拆分呢？下面以一个电商系统为案例分析一下。在一个单体架构中，完整的电商系统应包括如下模块
+
+1. 商城系统，负责用户登录、查看以及搜索商品、购物车商品管理、优惠券管理、订单管理、支付等功能
+
+2. 物流及仓储系统，根据用户订单，进行发货、退货、换货等一系列仓储、物流管理
+
+3. 其他客服系统、客户管理系统等
+
+因此在分布式架构中，可以按照整体功能，将单体应用垂直拆分成以上三个大功能模块，各个功能模块可以选择不同的技术栈实现，按需弹性扩缩容
+
+![分布式架构](./images/conf_disc_1.png)
+
+那什么又是微服务架构呢？
+
+它是对各个功能模块进行更细粒度的拆分，比如商城系统模块可以拆分为:
+- 用户鉴权模块
+- 商品模块
+- 购物车模块
+- 优惠券模块
+- 支付模块
+- ...
+
+在微服务架构中，每个模块职责更加单一、独立部署、开发迭代快
+
+![微服务架构](./images/conf_disc_2.png)
+
+那么在分布式以及微服务架构中，各个模块之间如何及时知道对方网络地址与端口、协议，进行接口调用呢？
+
+### 为什么需要服务发现中间件
+
+其实这个知道的过程，就是服务发现。在早期的时候往往通过硬编码、配置文件声明各个依赖模块的网络地址、端口，然而这种方式在分布式以及微服务架构中，其运维效率、服务可用性是远远不够的
+
+那么我们能否实现一个通过一个特殊服务就查询到各个服务的后端部署地址呢？各服务启动的时候，就自动将IP和Port、协议等信息注册到特殊服务上，当某服务出现异常时，特殊服务就自动删除异常实例信息？
+
+是的，当然可以，这个特殊服务就是「注册中心服务」，可以基于etcd、Zookeeper、condul等实现
+
+### etcd服务发现原理
+
+那么如何基于etcd实现服务发现呢？
+
+![服务发现](./images/conf_disc_3.png)
+
+- 整体分为四层，client层、proxy层（可选）、业务server、etcd存储层组成。引入proxy层的原因是使用client更轻，逻辑更简单，无需直接访问存储层，同时可通过proxy层支持各种协议
+
+- client层通过负载均衡访问proxy组件。proxy组件启动的时候，通过etcd的Range RPC方法从 etcd 读取初始化服务配置数据，随后通过 Watch 接口持续监听后端业务server扩缩容变化，实时修改路由
+
+- proxy组件收到client的请求后，它根据从etcd读取到的对应服务的路由配置、负载均衡算法（比如 Round-robin）转发到对应的业务server
+
+- 业务server启动的时候，通过etcd的写接口 Txn/Put 等，注册自身地址信息、协议到高可用的etcd集群上。业务 server 缩容、故障时，对应的key应能自动从 etcd 集群删除，因此相关 key 需要关联 lease 信息，设置一个合理的 TTL，并定时发送 keepalive 请求给 Leader 续租，以防止租约以及 key 被淘汰
+
+在分布式以及微服务架构中，要面对的问题不仅仅是服务发现，还包括如下痛点:
+
+- 限速
+- 鉴权
+- 安全
+- 日志
+- 监控
+- 丰富的发布策略
+- 链路追踪
+- ...
+
+为了解决以上痛点，各大公司以及社区开发者推出了大量的开源项目。就以国内开发者广泛使用的Apache APISIX 项目为例，分析etcd在其中的应用
+
+### Apache APISIX原理
+
+Apache APISIX 的本质是一个无状态、高性能、实时、动态、可水平扩展的 API 网关。核心原理就是基于配置的服务信息、路由规则等信息，将收到的请求通过一系列规则后，正确转发给后端的服务
+
+Apache APISIX 其实就是上面服务发现原理架构图中的 proxy 组件
+
+![Apache APISIX](./images/conf_disc_4.png)
+
+Apache APISIX 详细架构图如下。它由控制面和数据面组成
+
+控制面顾名思义，就是通过 Admin API 下发服务、路由、安全配置的操作。控制面默认的服务发现存储是etcd，当然也支持consul、nacos等
+
+数据面是在实现基于服务路由信息数据转发的基础上，提供了限速、鉴权、安全、日志等一些列功能，也就解决了分布式及微服务架构中的典型痛点
+
+![Apache APISIX](./images/conf_disc_5.png)
+
+那么当我们通过控制面API新增一个服务时，Apache APISIX 是如何实现实时、动态调整服务配置，而不需要重启网关服务的呢
+
+### etcd 在 Apache APISIX 中的应用
+
+#### 数据存储格式
+
+通过 Admin API 新增了两个服务、路由规则后，执行如下查看 etcd 所有 key 的命令
+
+```bash
+etcdctl get "" --prefix --keys-only
+```
+
+etcd输出结果如下:
+
+```text
+/apisix/consumers/
+/apisix/data_plane/server_info/f7285805-73e9-4ce4-acc6-a38d619afdc3
+/apisix/global_rules/
+/apisix/node_status/
+/apisix/plugin_metadata/
+/apisix/plugins
+/apisix/plugins/
+/apisix/proto/
+/apisix/routes/
+/apisix/routes/12
+/apisix/routes/22
+/apisix/services/
+/apisix/services/1
+/apisix/services/2
+/apisix/ssl/
+/apisix/ssl/1
+/apisix/ssl/2
+/apisix/stream_routes/
+/apisix/upstreams/
+```
+
+然后继续通过 etcdctl get 命令查看下 servcies 都存储了哪些信息呢？
+
+```text
+root@e9d3b477ca1f:/opt/bitnami/etcd# etcdctl get /apisix/services --prefix
+/apisix/services/
+init_dir
+/apisix/services/1
+{"update_time":1614293352,"create_time":1614293352,"upstream":{"type":"roundrobin","nodes":{"172.18.5.12:80":1},"hash_on":"vars","scheme":"http","pass_host":"pass"},"id":"1"}
+/apisix/services/2
+{"update_time":1614293361,"create_time":1614293361,"upstream":
+{"type":"roundrobin","nodes":{"172.18.5.13:80":1},"hash_on":"vars","scheme":"http","pass_host":"pass"},"id":"2"}
+```
+
+- Apache APISIX 2.x 系列版本使用的是 etcdv3
+- 服务、路由、ssl、插件等配置存储格式前缀是 /apisix + "/" + 功能特性类型（routes/services/ssl等），通过 Admin API 添加的路由、服务等配置就保存在相应的前缀下
+- 路由和服务配置的 value 是个 Json 对象，其中服务对象包含了 id、负载均衡算法、后端节点、协议等信息
+
+#### Watch机制的应用
+
+与 Kubernetes 一样，他们都是通过 etcd 的 Watch 机制来实现的
+
+Apache APISIX 在启动的时候，首先会通过 Range 操作获取网关的配置、路由等信息，随后就通过 Watch 机制，获取增量变化事件
+
+那么使用 Watch 机制最容易犯错的地方是什么呢？
+
+答案是不处理 Watch 返回的相关错误信息，比如已压缩 ErrCompacted 错误。Apache APISIX 项目在从 etcd v2 中切换到 etcd v3 早期的时候，同样也犯了这个错误
+
+#### 鉴权机制的应用
+
+除了 Watch 机制，Apache APISIX 项目还使用了鉴权，配置网关是个高危操作，那么它是如何使用etcd鉴权机制的呢？etcd鉴权机制中最容易踩的坑是什么呢？
+
+答案是不复用 client 和 鉴权 token，频繁发起 Authenticate 操作，导致 etcd 高负载。这个 8C32G 的高配节点在100个连接时，Authenticate QPS 仅为8。所以牢记复用client和token
+
+#### Lease特性的应用
+
+服务发现的核心工作原理是服务启动的时候将地址信息登录到注册中心，服务异常时自动从注册中心删除
+
+Apache APISIX 通过 etcdv2 的 TTL 特性、etcdv3 的Lease特性来实现类似「如何检测客户端的存活性」，它提供的增加服务路由API，支持设置TTL属性，如下所示
+
+```text
+# Create a route expires after 60 seconds, then it's deleted automatically
+$ curl http://127.0.0.1:9080/apisix/admin/routes/2?ttl=60 -H 'X-API-KEY: edd1c9f034335f136f87ad84b625c8f1' -X PUT -i -d '
+{
+    "uri": "/aa/index.html",
+    "upstream": {
+        "type": "roundrobin",
+        "nodes": {
+            "39.97.63.215:80": 1
+        }
+    }
+}'
+```
+
+当一个路由设置非0 TTL后，Apache APISIX就会为它创建Lease，关联 key，相关代码如下:
+
+```text
+-- lease substitute ttl in v3
+local res, err
+if ttl then
+    local data, grant_err = etcd_cli:grant(tonumber(ttl))
+    if not data then
+        return nil, grant_err
+    end
+    res, err = etcd_cli:set(prefix .. key, value, {prev_kv = true, lease = data.body.ID})
+else
+    res, err = etcd_cli:set(prefix .. key, value, {prev_kv = true})
+end
+```
+
+#### 事务特性的应用
+
+为什么Apache APISIX还会依赖 etcd 的事务特性呢？简单的执行put接口有什么问题？
+
+答案是它跟 Kubernetes 是一样的使用目的。使用事务是为了防止并发场景下的数据写冲突，比如你可能同时发起两个 Patch Admin API 去修改配置等。如果简单地使用 put 接口，就会导致第一个写请求的结果被覆盖
+
+那么 Apache APISIX 是如何使用事务接口提供的乐观锁机制去解决并发冲突的问题呢？
+
+核心依然是 mod_revision，它会比较事务提交时的 mod_revision与预期是否一致，一致才能执行put操作
+
+```text
+local compare = {
+    {
+        key = key,
+        target = "MOD",
+        result = "EQUAL",
+        mod_revision = mod_revision,
+    }
+}
+local success = {
+    {
+        requestPut = {
+            key = key,
+            value = value,
+            lease = lease_id,
+        }
+    }
+}
+local res, err = etcd_cli:txn(compare, success)
+if not res then
+    return nil, err
+end
+```
