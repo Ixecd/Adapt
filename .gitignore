@@ -8,3 +8,5 @@ data.etcd/
 *.snap
 
 *.log
+
+.vscode/
