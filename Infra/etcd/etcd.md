@@ -3557,3 +3557,346 @@ etcd v3的Watch是基于MVCC机制实现的，而Consul是采用滑动窗口实�
 - 事务比较。etcd和Consul都提供了简易的事务能力，支持对字段进行比较，而ZooKeeper只提供了版本号检查能力，功能较弱
 - 多数据中心。在多数据中心支持上，只有Consul是天然支持的，虽然它本身不支持数据自动跨数据中心同步，但是他提供的服务发现机制、Prepaared Query功能，赋予了业务在一个可用区后端实例故障时，可将请求转发到最近的数据中心实例。而etcd和ZooKeeper并不支持
 
+## 运维: 如何构建高可靠的etcd集群运维体系?
+
+在使用etcd的过程中，经常会面临一系列问题与选择
+
+- etcd使用虚拟机还是容器部署，各有什么优缺点？
+- 如何及时发现etcd集群隐患项（比如数据不一致）？
+- 如何及时监控及告警etcd的潜在隐患（比如db大小即将达到配额）？
+- 如何优雅的定时、甚至跨城备份etcd数据？
+- 如何模拟磁盘IO等异常来复现Bug、故障？
+
+### 整体解决方案
+
+etcd 运维体系建设的核心要点，由 etcd 集群部署、成员管理、监控及告警体系、备份及还原、巡检、高可用及自愈、混沌工程等维度组成
+
+![运维体系](./images/ops_1.png)
+
+### 集群部署
+
+计算资源的选择，它本质上就是计算资源的交付演进史，分别如下:
+
+- 物理机
+- 虚拟机
+- 裸容器（Docker）
+- Kubernetes容器编排
+
+物理机资源交付慢、成本高、扩缩容流程费时，一般情况下大部分业务团队不再考虑物理机，除非是超大规模的上万个节点的Kubernetes集群，对CPU、内存、网络资源有着极高诉求
+
+虚拟机是目前各个云厂商售卖的主流实例，无论是基于KVM还是Xen实现，都具有良好的稳定性、隔离性，支持故障热迁移，可弹性伸缩，被etcd、数据库等存储业务大量使用
+
+在基于物理机和虚拟机的部署方案中，推荐使用 `ansible`、`puppet`等自动运维工具，构建标准、自动化的etcd集群搭建、扩缩容流程。基于 ansible 部署 etcd 集群可以拆分成以下若干个任务:
+
+- 下载及安装 etcd 二进制到指定目录
+- 将 etcd 加入 systemd 等服务管理
+- 为 etcd 增加配置文件，合理设置相关参数
+- 为 etcd 集群各个节点生成相关证书，构建一个安全的集群
+- 组件集群版（静态配置、动态配置，发现集群其他节点）
+- 开启 etcd 服务，启动 etcd 集群
+
+[使用 ansible 部署一个安全的 etcd 集群](https://www.digitalocean.com/community/tutorials/how-to-set-up-and-secure-an-etcd-cluster-with-ansible-on-ubuntu-18-04)
+
+容器化部署则具有极速的交付效率、更灵活的资源控制、更低的虚拟化开销等一系列优点。自从 Docker 诞生后，容器化部署就风靡全球。有的业务直接用裸 Docker 容器来跑 etcd 集群。然而裸 Docker 容器不具备调度、故障自愈、弹性扩容等特性，存在较大局限性。
+
+为了解决以上问题，诞生了以 Kubernetes、Swarm 为首的容器编排平台，Kubernetes成为了容器编排的大哥，大量业务使用 Kubernetes 来部署 etcd、ZooKeeper 等有状态服务。在开源社区中，也诞生了若干个 etcd 的 Kubernetes 容器化解决方案
+
+- etcd-operator
+- bitnami etcd/statefulset
+- etcd-cluster-operator
+- openshit😂/cluster-etcd-operator（少打了个字母，应该是openshift）
+- kubeadm
+
+[etcd-operator](https://github.com/coreos/etcd-operator) 这玩意已经归档了，基本废弃。它是基于裸 Pod 实现的，要做好各种备份。在部分异常情况下存在集群宕机、数据丢失风险
+
+[bitnami etcd](https://bitnami.com/stack/etcd/helm) 提供了一个 helm 包一键部署 etcd 集群，支持各个云厂商，支持使用 PV、PVC持久化存储数据，底层基于 StatefulSet 实现，比较稳定
+
+可以通过如下 helm 命令，快速在 Kubernetes 集群中部署一个etcd集群
+
+```zsh
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm install my-release bitnami/etcd
+```
+
+etcd-cluster-operator和 openshift/cluster-etcd-operator比较小众，目前 star 不多，但是有相应的开发者维护，可参考下它们的实现思路，与 etcd-operator 基于 Pod、bitnami etcd 基于 Statefulset 实现不一样的是，它们是基于 ReplicaSet 和 Static Pod 实现的
+
+[kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/setup-ha-etcd-with-kubeadm/)，它是 Kubernetes集群中的 etcd 高可用部署方案的提供者，kubeadm 是基于 Static Pod 部署 etcd 集群的。Static Pod 相比普通 Pod 有其特殊性，它是直接由节点上的 kubelet 进程来管理的，无需通过 kube-apiserver
+
+创建 Static Pod 方式有两种，分别是配置文件和HTTP。kubeadm使用的是配置文件，也就是在kubelet监听的静态Pod目录下（一般是 /etc/kubernetes/manifests）放置相应的etcd Pod YAML文件即可
+
+![static pod](./images/ops_2.png)
+
+在这种部署方式中，部署 etcd 的节点需要部署 docker、kubelet、kubeadm组价，依赖较重
+
+### 集群组建
+
+etcd 目前通过一次只允许添加一个节点的方式，可安全的实现在线成员变更。因为这是 Raft 算法的安全性要求，否则会出现脑裂
+
+1. 添加新节点为Learner（学习者）
+   - Learner接收日志复制，但不参与投票
+   - 不影响集群的多数派计算
+
+2. Learner追上进度
+   - 同步数据到接近Leader
+   - 这个过程可能需要一段时间
+
+3. Promote Learner为Voting Member
+   - 将Learner提升为正式的voting member
+   - 此时新节点已经有完整数据，可以安全参与投票
+
+需要特别注意的是，当变更集群成员节点时，节点的 `initial-cluster-state` 参数的取值可以是 `new` 或 `existing`
+
+- new，一般用于初始化启动一个新集群的场景。当设置为new时，它会根据initial-cluster-token、initial-cluster等参数信息计算集群ID、成员ID信息
+
+- existing，表示etcd节点加入一个已经存在的集群，它会根据 peerURLs 信息从 Peer 节点获取已存在的集群ID信息，更新自己本地配置、并将本身节点信息发布到集群中
+
+在 etcd 中，无论是 Leader 选举还是日志同步，都涉及到与其他节点通信。因此组建集群的第一步得得知集群总成员数、各个成员节点的IP地址等信息
+
+这个过程就是发现（Discovery）。目前 etcd 主要通过两种方式来获取以上信息，分别是 static configuration 和 dynamic service discovery
+
+- static configuration 是指集群总成员节点数、成员节点的 IP 地址都是已知、固定的，根据 initial-cluster-state 原理，有如下两个方法可基于静态配置组建一个集群
+
+   方法 1，三个节点的 initial-cluster-state 都配置为 new，静态启动，initial-cluster 参数包含三个节点信息即可，[社区文档](https://etcd.io/docs/v3.4/op-guide/clustering/)
+   
+   方法 2，第一个节点 initial-cluster-state 设置为 new，独立成集群，随后第二和第三个节点都为 existing，通过扩容的方式，不断加入到第一个节点所组成的集群中
+
+- 如果成员节点信息是未知的，可以通过 dynamic service discovery 机制解决。etcd 社区还提供了通过公共服务来发现成员节点信息，组建集群的方案。它的核心是集群内的各个成员节点向公共服务注册成员地址等信息，各个节点通过公共服务来发现彼此，[官方详细文档](https://etcd.io/docs/v3.4/dev-internal/discovery_protocol/)
+
+
+### 监控与告警体系
+
+把集群部署起来后，在业务开始使用之前，部署监控是必不可少的一个环节，它是保障业务稳定性，提前发现风险、隐患点的重要核心手段。etcd 提供了丰富的 metrics 来展示整个集群的核心指标、健康度。metrics 按模块可划分为磁盘、网络、MVCC 事务、gRPC RPC、etcdserver
+
+磁盘相关的 metrics 及含义如下图所示
+
+![metrics](./images/ops_3.png)
+
+网络相关的 metrics 及含义如下图所示
+
+![network](./images/ops_4.png)
+
+mvcc相关的较多，只罗列部分，如下图所示
+
+![mvcc](./images/ops_5.png)
+
+etcdserver相关的如下，集群是否有 leader、堆积的 proposal 数据等都在此模块
+
+![etcdserver](./images/ops_6.png)
+
+更多的 metrics，可以通过如下方法查看
+
+```bash
+curl 127.0.0.1:2379/metrics
+```
+
+后面只需要配置 Prometheus 服务，采集 etcd 集群的 2379 端口的 metrics 路径
+
+采集的方案一般有两种，静态配置和动态配置
+
+静态配置是指添加待监听的 etcd target 到 Prometheus 配置文件，如下所示
+
+```yml
+global:
+  scrape_interval: 10s
+scrape_configs:
+  - job_name: test-etcd
+    static_configs:
+    - targets:
+ ['10.240.0.32:2379','10.240.0.33:2379','10.240.0.34:2379']
+```
+
+静态配置的缺点是每次新增集群、成员变更都需要人工修改配置，而动态配置就可以解决这个痛点
+
+动态配置是通过 Prometheus-Operator 的提供 ServiceMonitor 机制实现的，当想采集一个 etcd 实例时，若 etcd 服务部署在同一个 Kubernetes 集群，只需要通过 Kubernetes 的 API 创建一个如下的 ServiceMonitor 资源即可
+
+若 etcd 集群与 Promehteus-Operator 不在同一个集群，则需要去创建、更新对应的集群 Endpoint
+
+那 Prometheus 是如何知道该采集哪些服务的 metrics 信息呢?答案 ServiceMonitor 资源通过 Namespace、Labels 描述了待采集实例对应的 Service Endpoint
+
+```yml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prometheus-prometheus-oper-kube-etcd
+  namespace: monitoring
+spec:
+  endpoints:
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    port: http-metrics
+    scheme: https
+    tlsConfig:
+      caFile: /etc/prometheus/secrets/etcd-certs/ca.crt
+      certFile: /etc/prometheus/secrets/etcd-certs/client.crt
+      insecureSkipVerify: true
+      keyFile: /etc/prometheus/secrets/etcd-certs/client.key
+  jobLabel: jobLabel
+  namespaceSelector:
+    matchNames:
+    - kube-system
+  selector:
+    matchLabels:
+      app: prometheus-operator-kube-etcd
+      release: prometheus
+```
+
+采集了 metrics 监控数据后，下一步就是要基于 metrics 监控数据告警了。可以通过 Prometheus 和 Altermanager 组件实现，那么为了哪些核心指标告警呢？
+
+当然是影响集群可用性的最核心的 metrics。比如是否有 Leader、Leader切换次数、WAL和事务操作延时。etcd社区提供了一个[丰富的告警规则](https://github.com/etcd-io/etcd/blob/v3.4.9/Documentation/op-guide/etcd3_alert.rules)
+
+为了方便查看 etcd 集群运行状况和提升定位问题的效率，可以基于采集的 metrics 配置个 grafana 可视化面板
+
+### 备份及还原
+
+监控及告警就绪后，就可以提供给业务在生产环境使用了吗？
+
+当然不行，数据是业务的安全红线，所以还需要做好最核心的数据备份工作
+
+怎么搞？
+
+主要有以下方法，首先是通过 etcdctl snapshot 命令行人工备份。在发起重要变更的时候，可以通过如下命令进行备份，并查看快照状态
+
+```bash
+ETCDCTL_API=3 etcdctl --endpoints $ENDPOINT 
+snapshot save snapshotdb
+ETCDCTL_API=3 etcdctl --write-out=table snapshot status snapshotdb
+```
+
+其次是通过定时任务进行定时备份，建议至少每隔1个小时备份一次
+
+然后通过[etcd-backup-operator](https://github.com/coreos/etcd-operator/blob/master/doc/user/walkthrough/backup-operator.md#:~:text=etcd%20backup%20operator%20backs%20up,storage%20such%20as%20AWS%20S3.)进行自动化备份，类似 ServcieMonitor，可以通过创建一个备份任务 CRD 实现。CRD如下
+
+```yaml
+apiVersion: "etcd.database.coreos.com/v1beta2"
+kind: "EtcdBackup"
+metadata:
+  name: example-etcd-cluster-periodic-backup
+spec:
+  etcdEndpoints: [<etcd-cluster-endpoints>]
+  storageType: S3
+  backupPolicy:
+    # 0 > enable periodic backup
+    backupIntervalInSecond: 125
+    maxBackups: 4
+  s3:
+    # The format of "path" must be: "<s3-bucket-name>/<path-to-backup-file>"
+    # e.g: "mybucket/etcd.backup"
+    path: <full-s3-path>
+    awsSecret: <aws-secret>
+```
+
+最后可以通过给 etcd 集群增加 Learner 节点，实现跨地域热备。因 Learner 节点属于非投票成员的节点，因此它并不会影响集群的性能。它的基本工作原理是当 Leader 收到写请求时，它会通过 Raft 模块将日志同步给 Learner 节点。你需要注意的是，在 etcd 3.4 中目前只支持 1 个 Learner 节点，并且只允许串行读
+
+### 巡检
+
+完成集群部署、了解成员管理、构建好监控及告警体系并添加好定时备份策略后，这时终于可以放心给业务使用了
+
+然而在后续业务使用过程中，可能会遇到各类问题，而这些问题很可能是 metrics 监控无法发现的，比如如下:
+
+- etcd 集群因重启进程、节点等出现数据不一致；
+- 业务写入大 key-value 导致 etcd 性能骤降；
+- 业务异常写入大量 key 数，稳定性存在隐患；
+- 业务少数 key 出现写入 QPS 异常，导致 etcd 集群出现限速等错误；
+- 重启、升级 etcd 后，需要人工从多维度检查集群健康度；
+- 变更 etcd 集群过程中，操作失误可能会导致 etcd 集群出现分裂；
+
+......
+
+因此为了实现高效治理 etcd 集群，可将这些潜在隐患总结成一个个自动化检查项，比如:
+
+- 如何高效监控 etcd 数据不一致性？
+- 如何及时发现大 key-value?
+- 如何及时通过监控发现 key 数异常增长？
+- 如何及时监控异常写入 QPS?
+- 如何从多维度的对集群进行自动化的健康检测，更安心变更？
+
+......
+
+如何将这些 etcd 的最佳实践策略反哺到现网大规模 etcd 集群的治理中去呢？答案就是巡检
+
+参考 ServiceMonitor 和 EtcdBackup 机制，同样可以通过 CRD 的方式描述此巡检任务，然后通过相应的 Operator 实现此巡检任务
+
+比如下面就是一个数据一致性巡检的 YAML 文件，其对应的 Operator 组件会定时、并发检查其关联的 etcd 集群各个节点的 key 差异数。
+
+```yml
+apiVersion: etcd.cloud.tencent.com/v1beta1
+kind: EtcdMonitor
+metadata:  
+creationTimestamp: "2020-06-15T12:19:30Z"  
+generation: 1  
+labels:    
+clusterName: gz-qcloud-etcd-03    
+region: gz    
+source: etcd-life-cycle-operator  
+name: gz-qcloud-etcd-03-etcd-node-key-diff  
+namespace: gz
+spec:  
+clusterId: gz-qcloud-etcd-03  
+metricName: etcd-node-key-diff  
+metricProviderName: cruiser  
+name: gz-qcloud-etcd-03  
+productName: tke  
+region: gz
+status:  
+records:  
+- endTime: "2021-02-25T11:22:26Z"    
+message: collectEtcdNodeKeyDiff,etcd cluster gz-qcloud-etcd-03,total key num is      
+122143,nodeKeyDiff is 0     
+startTime: "2021-02-25T12:39:28Z"  
+updatedAt: "2021-02-25T12:39:28Z"
+```
+
+### 高可用及自愈
+
+通过以上机制，已经基本建设好一个高可用的 etcd 集群运维体系了。最后提供几个集群高可用及自愈的小建议:
+
+- 若 etcd 集群性能已满足业务诉求，可容忍一定的延时上升，建议将 etcd 集群做高可用部署，比如对 3 个节点来说，把每个节点部署在独立的可用区，可容忍任意一个可用区故障
+
+- 逐步尝试使用 Kubernetes 容器化部署 etcd 集群。当节点出现故障时，能通过 Kubernetes 的自愈机制，实现故障自愈
+
+- 设置合理的 db quota 值，配置合理的压缩策略，避免集群 db quota 满从而导致集群不可用的情况发生。
+
+### 混沌工程
+
+在使用 etcd 的过程中，可能会遇到磁盘、网络、进程异常重启等异常导致的故障。如何快速复现相关故障进行问题定位呢？
+
+答案就是混沌工程
+
+一般常见的异常我们可以分为如下几类:
+
+- 磁盘 IO 相关的。比如模拟磁盘 IO 延时上升、IO 操作报错。之前遇到的一个底层磁盘硬件异常导致 IO 延时飙升，最终触发了 etcd 死锁的 Bug，我们就是通过模拟磁盘 IO 延时上升后来验证的
+- 网络相关的。比如模拟网络分区、网络丢包、网络延时、包重复等
+- 进程相关的。比如模拟进程异常被杀、重启等。之前遇到的一个非常难定位和复现的数据不一致 Bug，我们就是通过注入进程异常重启等故障，最后成功复现
+- 压力测试相关的。比如模拟 CPU 高负载、内存使用率等
+
+开源社区在混沌工程领域诞生了若干个优秀的混沌工程项目，如 chaos-mesh、chaos-blade、litmus。这里重点介绍下[chaos-mesh](https://github.com/chaos-mesh/chaos-mesh)，它是基于 Kubernetes 实现的云原生混沌工程平台，下图是其架构图（引用自社区）
+
+![chaos-mesh](./images/ops_7.png)
+
+为了实现以上异常场景的故障注入，chaos-mesh 定义了若干种资源类型，分别如下:
+
+- IOChaos，用于模拟文件系统相关的 IO 延时和读写错误等
+- NetworkChaos，用于模拟网络延时、丢包等
+- PodChaos，用于模拟业务 Pod 异常，比如 Pod 被杀、Pod 内的容器重启等
+- StressChaos，用于模拟 CPU 和内存压力测试
+
+当希望给 etcd Pod 注入一个磁盘 IO 延时的故障时，只需要创建此 YAML 文件就好
+
+```yml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IoChaos
+metadata:
+  name: io-delay-example
+spec:
+  action: latency
+  mode: one
+  selector:
+    labelSelectors:
+      app: etcd
+  volumePath: /var/run/etcd
+  path: '/var/run/etcd/**/*'
+  delay: '100ms'
+  percent: 50
+  duration: '400s'
+  scheduler:
+    cron: '@every 10m'
+```
