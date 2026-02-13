@@ -3046,3 +3046,844 @@ $ kind delete cluster -n onex
 # 删除所有的 Kind 集群
 $ kind delete clusters -A
 ```
+
+## 如何在Kubernetes集群中部署Web服务？
+
+之前我们的软件会部署在物理机、虚拟机上或者直接用 Docker 来部署。但是在云原生时代，软件的部署模式发生了很大的变化。得益于 Kubernetes 强大的功能，越来越多的软件选择在 Kubernetes 上部署，这几乎已经成为事实上的标准。因此，在本课程中，OneX 项目也选择部署在了 Kubernetes 中
+
+本节课的核心目标是带你在 Kubernetes 上快速部署 OneX 项目，准备好一个开发测试环境
+
+### 创建 OneX Kind 集群
+
+要在 Kubernetes 上部署 OneX，首先我们要创建一个开发、测试用的 Kubernetes 集群。这里，使用 Kind 工具来快速创建一个 Kind 集群。具体步骤如下：
+
+1. 安装 Kind 工具创建
+
+2. Kind 集群配置创建
+
+3. Kind 集群访问
+
+4. Kind 集群
+
+提示：在实际的项目开发中，我们通常称 Kind 创建的集群为 Kind 集群
+
+#### 步骤1：安装 Kind 工具
+
+`brew install kind`
+
+#### 步骤2：创建 Kind 集群配置
+
+创建一个 Kind 集群通常需要配置集群的服务 CIDR、Pod CIDR、集群域名等。Kind 提供了–config 命令行选项，可以使我们指定一个配置文件，来配置 Kind 集群。你可以阅读 Kind [官方文档](https://kind.sigs.k8s.io/docs/user/configuration/)来了解这些配置项
+
+为了简化操作，OneX 项目仓库中包含了一个预定义的 Kind 集群配置 kind-onex.yaml，配置文件中包含了常用的配置项设置及说明，你只需要稍加修改便可以使用，修改命令如下：
+
+```bash
+$ HOSTIP=`ip -o -4 addr show eth0 | ip -o -4 addr show eth0 | awk '{split($4, a, "/"); print a[1]}'`
+$ sed "s/apiServerAddress.*/apiServerAddress: ${HOSTIP}/g" manifests/installation/kubernetes/kind-onex.yaml > /tmp/kind-onex.yaml
+```
+
+上述命令将 apiServerAddress 修改为你的宿主机 eth0 网卡的 IP 地址，这样我们才能在宿主机上访问 Kind 集群的 kube-apiserver。如果宿主机没有 eth0 网卡，或者 eth0 网卡 IP 地址不可访问，需要你自行获取 IP 地址并替换
+
+等价的在Mac上的命令如下所示
+
+```zsh
+# 自动检测 en0 (Mac 常用网卡) 的 IP
+HOSTIP=$(ipconfig getifaddr en0)
+
+# 执行替换
+sed "s/apiServerAddress.*/apiServerAddress: ${HOSTIP}/g" manifests/installation/kubernetes/kind-onex.yaml > /tmp/kind-onex.yaml
+
+# 验证一下
+echo "Detected Host IP: ${HOSTIP}"
+grep "apiServerAddress" /tmp/kind-onex.yaml
+```
+
+#### 步骤3：创建 Kind 集群
+
+有了 Kind 集群配置之后，我们就可以使用该配置来快速创建一个开发、测试用的 Kind 集群，创建命令如下：
+
+```bash
+$ kind create cluster --config=/tmp/kind-onex.yaml # 创建一个名为 onex 的 Kind 集群
+$ kind get clusters # 查询 Kind 集群列表
+onex
+```
+
+上述命令会成功创建一个有 3 个节点的 Kind 集群，并将 kubectl 命令的 context 设置为新创建的 Kind 集群
+
+另外，一个开发、测试用的 Kubernetes 节点，最好具有 2 个及以上的节点。多个节点有利于观察调度器的行为，方便我们后续对调度器进行观察、测试等操作。
+
+```zsh
+# 1. 自动获取你 Mac 当前最真实的内网 IP (或者直接用 127.0.0.1)
+MY_IP="127.0.0.1"
+
+# 2. 确保挂载目录存在并有权限
+mkdir -p ~/kind/data
+chmod 777 ~/kind/data
+
+# 3. 使用 sed 动态修复你的配置文件并重定向到一个新文件
+# 我们顺便把那个该死的根目录挂载路径也改了
+sed "s/apiServerAddress: .*/apiServerAddress: ${MY_IP}/g" kind-onex.yml | \
+sed "s|hostPath: /kind/onex|hostPath: ${HOME}/kind/data|g" > /tmp/kind-onex-mac.yaml
+
+# 4. 再次尝试创建集群
+kind create cluster --config=/tmp/kind-onex-mac.yaml
+```
+
+![kind](./images/kind_2.png)
+
+你可以通过以下命令来检查 Kind 集群是否正常运行：
+
+![kind](./images/kind_3.png)
+
+如果想删除 OneX 集群，可以通过 `kind delete cluster --name=onex` 命令来删除
+
+#### 步骤4：访问 Kind 集群
+
+我们通过 kubectl cluster-info 来访问新建的 Kind 集群，以验证集群成功创建。访问命令如下：
+
+```bash
+$ kubectl config use-context kind-onex
+$ kubectl cluster-info --context kind-onex
+Kubernetes control plane is running at https://127.0.0.1:16443
+CoreDNS is running at https://127.0.0.1:16443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+
+
+To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+```
+
+这里要注意，如果我们创建的 Kind 集群名字为 xxx，那么在 $HOME/.kube/config 文件中的 context 名字为 kind-xxx。如果我们有多个 Kind 集群，在使用 kubectl config use-context 命令切换 context 时，不要搞错 context 名字
+
+#### 部署存储服务
+
+创建完开发、测试用的 Kind 集群之后，就可以在集群中部署需要的组件了。首先，我们需要部署 OneX 项目组件依赖的一些存储服务，主要有（部署不分顺序）：
+
+1. MariaDB 安装和配置
+2. Redis 安装和配置
+3. etcd 安装和配置
+4. MongoDB 安装和配置
+
+![kind](./images/kind_4.png)
+
+因为存储服务是有状态服务，所以我们需要使用 Kubernetes 的 StatefulSet 资源来部署。
+
+##### MariaDB 安装和配置
+
+![onex](./images/kind_5.png)
+
+
+上述安装命令会在 Kubernetes 集群中 infra 命名空间下创建以下 3 个资源：
+
+- 名为 mariadb 的 Secret 资源，Secret 中会保存 MariaDB 的用户名和密码，该 Secret 会在 StatefulSet 中被挂载为 Pod 的环境变量
+
+- 名为 mariadb 的 StatefulSet 资源，StatefulSet 会创建一个有状态的 Pod：mariadb-0
+
+- 名为 mariadb的 Service 资源，Kubernetes 集群内的通信可以通过 Service 来做服务发现。一个 Service 其实就是一个域名，Kubernetes 的 DNS 服务会解析 Service 名为真正的 Pod IP
+
+我们重点来看几个资源的资源定义文件内容
+
+首先，创建 StatefulSet 资源的资源定义文件为：statefulset.yaml，内容如下：
+
+```yml
+# 指定了使用的Kubernetes API版本
+apiVersion: apps/v1
+# 指定了要创建的Kubernetes资源类型，这里是StatefulSet，表示要创建一个有状态的副本集
+kind: StatefulSet
+# 包含关于StatefulSet的元数据信息，如名称等
+metadata:
+  # 指定StatefulSet的名称为mariadb
+  name: mariadb
+  # 指定了 Statefulset 的标签
+  labels:
+    app: mariadb
+# 指定StatefulSet的规格，包括副本数量、选择器、Pod模板等信息
+spec:
+  # 指定了要创建的Pod副本数量为1
+  replicas: 1
+  # 指定了用于选择Pod的标签
+  selector:
+    matchLabels:
+      app: mariadb
+  # 指定了要创建的Pod的模板信息
+  template:
+    # 指定了Pod的元数据信息，包括标签等
+    metadata:
+      # 指定了Pod的标签
+      labels:
+        app: mariadb
+    # 指定了Pod的规格，包括容器、端口、存储卷挂载、环境变量等信息
+    spec:
+      # 指定了Pod中的容器信息
+      containers:
+      # 指定了容器的名称为mariadb
+      - name: mariadb
+        # 指定了要使用的镜像为mariadb:11.2.2
+        image: mariadb:11.2.2
+        # 指定了容器需要暴露的端口
+        ports:
+        - containerPort: 3306
+          name: mariadb
+        # 指定了要挂载的存储卷信息
+        volumeMounts:
+        # 指定了要挂载的存储卷的名称为mariadb-persistent-storage
+        - name: mariadb-persistent-storage
+          # 指定了存储卷在容器中的挂载路径
+          mountPath: /var/lib/mysql
+        # 指定了容器的环境变量
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "onex(#)666"
+        - name: MYSQL_DATABASE
+          value: "onex"
+        - name: MYSQL_USER
+          value: "onex"
+        - name: MYSQL_PASSWORD
+          value: "onex(#)666"
+  # 指定了要创建的持久化存储卷模板信息
+  volumeClaimTemplates:
+  # 指定了存储卷模板的元数据信息
+  - metadata:
+      # 指定了存储卷模板的名称
+      name: mariadb-persistent-storage
+    # 指定了存储卷的规格信息，包括访问模式和资源请求等
+    spec:
+      # 指定了存储卷的访问模式为"ReadWriteOnce"，表示可以被单个节点挂载为读写模式
+      accessModes: [ "ReadWriteOnce" ]
+      # 指定了存储卷的资源请求信息
+      resources:
+        # 指定了存储卷的请求资源
+        requests:
+          # 指定了存储卷的容量为1GB
+          storage: 1Gi
+```
+
+然后，创建 Service 资源的资源定义文件为: service.yaml，内容如下:
+
+```yml
+# 指定了使用的Kubernetes API版本，这里是v1，表示使用了核心API的v1版本
+apiVersion: v1
+# 指定了要创建的Kubernetes资源类型，这里是Service，表示要创建一个服务
+kind: Service
+metadata:
+  # 指定了服务名
+  name: mariadb
+  # 指定了 Service 的标签
+  labels:
+    app: mariadb
+# 指定Service的规格，包括服务类型、选择器、端口等信息
+spec:
+  # 指定了Service的类型为NodePort，表示将会为该服务在每个节点上分配一个端口，通过该端口可以访问Service
+  type: NodePort
+  # 指定了用于选择后端Pod的标签
+  selector:
+    app: mariadb
+  # 指定了Service需要暴露的端口信息
+  ports:
+    # 指定了端口的协议为TCP
+    - protocol: TCP
+      # 指定了Service监听的端口为3306
+      port: 3306
+      # 指定了要转发到的后端Pod的端口为3306
+      targetPort: 3306
+      # 指定了分配给Service的节点端口号为30000，表示可以通过节点的IP地址和该端口号来访问Service
+      nodePort: 30000
+```
+
+![test](./images/kind_6.png)
+
+从 macOS 宿主机到 Kind 内部数据库查看表结构的整个链路，我们可以将其拆解为 “三层空间，三个步骤” 的穿透过程
+
+1. 流量穿透图解（Architecture Flow）
+
+要在 macOS 上查看 Kind 内部的数据库，数据包实际上经历了以下路径：
+[macOS 终端] → [Docker 容器网络] → [Kind 节点内部] → [K8s Service (DNS)] → [MariaDB Pod]
+
+2. 详细流程拆解
+
+  - 第一步：建立「跳板机」（创建交互Pod「进屋」）。执行的 `kubectl run mariadb-client ...` 命令，实际上是在 K8s 集群内启动了一个临时的 Linux 容器。
+    - 为什么这么做？因为 macOS 宿主机直接访问 Pod IP 非常麻烦。通过在集群内部启动一个容器，我们可以利用 K8s 内部 DNS（直接通过名字 mariadb 找到数据库）轻松连接。
+    - 关键参数：`--rm` 保证退出后容器自动销毁，不占用集群资源
+
+  - 第二步：启动数据库客户端（打开「柜子」）
+    - mariadb -h mariadb -uonex -p'onex(#)666'
+    -h mariadb：这里的 mariadb 是在 infra 命名空间下创建的 Service 名字。K8s 会自动将其解析为 MariaDB Pod 的真实 IP
+    - -uonex -p...：这是在创建 Secret 时定义的凭证
+    - 结果：此时你的 Shell 提示符从 root@mariadb-client:/# 变成了 MariaDB [(none)]>，这说明你已经越过了操作系统层，直接接管了数据库进程
+
+  - 第三步：执行SQL命令（查看结构）
+
+如果命令成功执行，并且 MariaDB 中有 onex 数据库，说明 MariaDB 部署成功。这里你可能会问，MariaDB 的访问端口是 3306，为什么访问的却是 30000？这个问题后面会解释，我们先把存储组件部署完
+
+Redis、etcd、MongoDB 的部署方式跟 MariaDB 是类似的，后面会简单介绍部署的指令，不再详述类似的内容
+
+##### Redis 安装和配置
+
+```bash
+kubectl -n infra apply -f manifests/installation/storage/redis
+redis-cli -h 127.0.0.1 -p 30001 -a 'onex(#)666'
+```
+
+![redis](./images/kind_7.png)
+
+![redis](./images/kind_8.png)
+
+##### etcd安装和配置
+
+```bash
+kubectl -n infra apply -f manifests/installation/storage/etcd
+
+etcdctl --endpoints=127.0.0.1:30002 member list
+```
+
+![etcd](./images/kind_9.png)
+
+##### MongoDB 安装和配置
+
+```bash
+$ kubectl create secret generic mongo --from-literal=MONGO_INITDB_ROOT_USERNAME=root --from-literal=MONGO_INITDB_ROOT_PASSWORD='onex(#)666'
+$ kubectl -n infra apply -f manifests/installation/storage/mongo
+```
+
+![mongo](./images/kind_10.png)
+
+![mongo](./images/kind_11.png)
+
+![mongo](./images/kind_12.png)
+
+MongoDB部署成功
+
+##### 服务网络访问路径
+
+在部署存储服务的时候你会发现，我们在宿主机上访问的服务端口并不是服务的端口，例如3306、6379、2379、27017 这些端口，而是 3000X 端口，这是为什么呢？
+
+接下来，就以访问 MariaDB 的网络访问路径为例，来给你详细介绍下：
+
+```bash
+$ mariadb -h 127.0.0.1 -P 30000 -uroot -p'onex(#)666'
+```
+
+我们在宿主机上部署了一个 Kubernetes 集群，集群中包含了 4 个 Node 节点：
+
+![kind](./images/kind_13.png)
+
+这 4 个 Node 节点其实是一个容器，在宿主机上执行以下命令可以验证
+
+![kind](./images/kind_14.png)
+
+在 Kubernetes 节点上，其实就是容器中，我们创建了一个名为 mariadb-0 的 Kubernetes Pod，执行以下命令可以验证：
+
+![kind](./images/kind_15.png)
+
+在上述命令中，首先通过执行 docker exec -it onex-worker3 bash 登录到名为 onex-worker3 的 Kubernetes Node 中，接着在 Kubernetes Node 中执行 crictl ps |grep mariadb，查看已创建的名为 mariadb-0 的 Kubernetes Pod
+
+总的来说，如果想访问 Kubernetes Pod 中的服务，具体的网络访问路径是从宿主机到 Node 容器，再到 Pod 容器。具体的网络访问路径图如下：
+
+![kind](./images/kind_16.png)
+
+首先，访问宿主机上的 30000 端口，宿主机的 30000 端口会将流量转发到 Kubernetes Node 容器中的 30000 端口，Kubernetes Node 容器中的 30000 端口，再将流量转发到 Kubernetes Pod 容器的 3306 端口。
+
+![ssl/tls](./images/kind_17.png)
+
+`mariadb -h 127.0.0.1 -P 30000 -uonex -p'onex(#)666' --ssl=FALSE`
+
+我这里没加选项，而是以「跳板机」的方式进入的，但是如果这样 NodePort 的 svc就没啥用了，看个人取舍吧，直接加个选项是最方便最好的。
+
+那么，这些端口是何时开启监听的呢？首先，我们启动了一个 Kubernetes Pod 容器，容器中运行了 mariadbd 进程，mariadbd 进程会监听 Kubernetes Pod 容器中的 3306 端口。接着，我们创建了名为 mariadb NodePort 类型的 Service，其定义如下：
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  labels:
+    app: mariadb
+spec:
+  type: NodePort
+  selector:
+    app: mariadb
+  ports:
+    - protocol: TCP
+      port: 3306
+      targetPort: 3306
+      nodePort: 30000
+```
+
+通过上述 Service 资源，我们在每个 Kubernetes Node 容器中，启动了一个 30000 端口，该端口会映射到该 Node 容器中部署的 3306 端口。在我们创建 Kind 集群时，kind-onex.yaml 文件中，有以下一段配置：
+
+```yml
+nodes:
+  extraPortMappings:
+  - containerPort: 30000 # MariaDB 3306
+    hostPort: 30000
+    listenAddress: "0.0.0.0"
+    protocol: TCP
+```
+
+kind 工具会根据上述配置，在宿主机上开启一个 30000 端口，该端口用来映射 Kubernetes Node 容器中的 30000 端口。其他 Kubernetes Node 容器端口和宿主机端口映射，具体可以查看 kind-onex.yaml 文件
+
+至此，建立了以下端口映射关系：
+
+![kind](./images/kind_18.png)
+
+这样，我们就可以通过访问宿主机上的 30000 端口，来访问 Kubernetes Pod 容器中 MariaDB 的 3306 端口
+
+kind-onex.yaml 文件中定义了需要的存储服务和中间件服务的端口映射，具体内容你可以看看我给出的表格：
+
+![kind](./images/kind_19.png)
+
+#### 中间件安装
+
+部署完存储服务，OneX 组件还依赖 Jaeger 和 Kafka 2 个中间件来实现调用链追踪和消息转存的功能。所以，我们还需要部署这 2 个组件
+
+首先我们来安装 Jaeger 中间件，具体的安装步骤如下：
+
+```bash
+kubectl -n infra apply -f manifests/installation/middleware/jaeger
+```
+![jaeger](./images/kind_20.png)
+
+如果端口 30005 能 telnet 通，说明安装成功。然后，我们来安装 Kafka，具体安装步骤如下：
+
+```bash
+kubectl -n infra apply -f manifests/installation/middleware/kafka
+```
+
+![kind](./images/kind_21.png)
+
+如果端口 30006 能 telnet 通，说明安装成功。
+
+#### 安装 Traefik
+
+如果想从集群外访问集群内部的服务，还需要安装一个 Ingress。社区有多重 Ingress 实现方案，例如 Nginx、Haproxy、Traefik 等。我们选择使用 Traefik 作为 Kubernetes 集群的 Ingress 选型，所以在部署 OneX 组件前，还需要在集群中安装 Traefik
+
+Traefik 安装配置比较复杂，官方提供了 [Helm 的安装方式](https://doc.traefik.io/traefik/getting-started/install-traefik/#use-the-helm-chart)，那这里我也选择使用 Helm 来安装 Traefik。具体安装步骤如下：
+
+1. 安装 Helm 命令行工具
+2. 安装 Traefik
+3. 访问 Traefik dashbaord
+4. 测试 Traefik
+
+接下来我们详细说说每一步都是怎么操作的
+
+##### 安装 Helm 命令行工具
+
+你可以执行以下命令来快捷安装 Helm ：
+
+```bash
+$ make tools.install.helm
+```
+
+或者
+
+`brew install helm`
+
+##### 安装 Traefik
+
+Traefik 的安装命令如下：
+
+![traefik](./images/kind_22.png)
+
+traefik-values.yaml 配置解析：
+
+- asDefault： 如果一个服务没有明确指定入口点，那么启用此入口点作为默认入口点
+
+- port： traefik 后端服务监听的端口
+
+- hostPort： hostPort 是将 Pod 的端口映射到宿主机上
+
+- hostIP： traefik 后端服务监听端口
+
+- expose: 将入口点公开到外部网络
+
+- exposedPort： Kubernetes 集群中 traefik 服务的端口
+
+- nodePort： nodePort 是将 service 的端口映射到集群中的每个宿主机上
+
+##### 访问 Traefik dashboard
+
+在宿主机和 Traefik Kubernetes Pod 之间建立端口转发，命令如下：
+
+```bash
+kubectl port-forward -n kube-system --address 0.0.0.0 $(kubectl get pods -n kube-system --selector "app.kubernetes.io/name=traefik" --output=name) 9001:9000
+```
+
+![kind](./images/kind_24.png)
+
+然后我们打开浏览器，访问 http://127.0.0.1:9001/dashboard/ 即可，控制台截图如下：
+
+
+![kind](./images/kind_23.png)
+
+
+该控制台可以进行一些简单的配置和流量观测。
+
+##### 测试 Traefik
+
+这里，我们使用一个测试 Pod ，来测试下 Traefik 是否被成功部署。创建测试 Pod 的命令如下：
+
+```bash
+$ kubectl apply -f ${ONEX_ROOT}/manifests/installation/traefik/whoami.yaml
+```
+
+![kind](./images/kind_25.png)
+
+上述命令成功执行，说明 Traefik 部署成功
+
+提示：这里的 18080 端口是在 kind-onex.yaml 文件中配置的。
+
+从集群内的 Pod 中访问 whoami Pod：
+
+![kind](./images/kind_26.png)
+
+这里要注意，要在 Traefik deployment args 中添加以下参数：
+
+`- --serversTransport.insecureSkipVerify=true`
+
+否则会出现以下错误：
+
+`500 Internal Server Error' caused by: tls: failed to verify certificate: x509: certificate is valid for 127.0.0.1`
+
+#### 安装 OneX 组件
+
+上面，我们安装完了 OneX 组件依赖的存储服务和中间件服务，接下来就可以部署 OneX 组件了
+
+##### 初始化数据库
+
+首先，我们需要初始化用到的数据库，也就是要初始化 MariaDB 和 MongoDB
+
+##### MariaDB 初始化
+
+首先是初始化 MariaDB
+
+第一步，创建具有普通权限的 MariaDB 用户，命令如下：
+
+![kind](./images/kind_27.png)
+
+第二步，执行以下命令，初始化 MariaDB 表：
+
+![kind](./images/kind_28.png)
+
+上述命令会初始化 OneX 表，并在 uc_user 表中创建一个默认的 admin 用户，其用户 ID 为 user-admin，具体信息你可以登录数据库查看：
+
+![kind](./images/kind_29.png)
+
+##### MongoDB 初始化
+
+因为在安装 MongoDB 时，创建的 admin 用户具有 MongoDB 的 root 权限，权限过大安全性会降低。为了提高安全性，我们还需要创建一个 OneX 普通用户来连接和操作 MongoDB。创建命令如下：
+
+![kind](./images/kind_30.png)
+
+在 MongoDB 连接字符串中，如果密码中包含特殊字符（如 @、/ 等），需要对其进行转义，比如 # 的 URL 编码为 %23，我们可以使用 URL 编码 / 解码 工具进行转义，也可以使用以下命令来转义：
+
+```bash
+encoded=$(echo -n "${ONEX_MONGO_ADMIN_PASSWORD}"|jq -sRr @uri)
+```
+
+mongodb://root:'onex(%23)666'@127.0.0.1:27017/onex?authSource=admin 各部分含义如下：
+
+- mongodb://：指示使用 MongoDB 协议连接。
+- root:'onex(#)666：这是用于身份验证的用户名和密码。在这种情况下，用户名是 root，密码是 onex(#)666。请注意，密码中的特殊字符 # 在 URL 中需要进行 URL 编码，因此被替换为 %23。
+- 127.0.0.1:30004：这是 MongoDB 服务器的主机和端口。在这种情况下，MongoDB 服务器位于本地主机（即 127.0.0.1）的 30004 端口上。
+- OneX：这是要连接的数据库的名称。在这种情况下，数据库名称是 OneX。
+- authSource=onex：这是指定身份验证数据库的选项。在这种情况下，身份验证数据库也是 OneX。
+
+创建完 OneX 普通用户后，我们就可以通过 OneX 用户登录 MongoDB 了：
+
+```bash
+$ mongosh --quiet mongodb://onex:'onex(%23)666'@127.0.0.1:30004/onex?authSource=onex
+```
+
+![kind](./images/kind_31.png)
+
+##### 安装前准备
+
+在部署 OneX 组件前，除了需要初始化数据库外，还需要进行以下前置操作：
+
+- 创建部署用的文件
+- 创建共用的 Kubernetes 资源
+- 配置 Linux hosts 文件
+
+接下来我们详细说说每一步的具体操作
+
+首先，创建部署用的文件：
+
+```bash
+# 设置一些环境变量
+$ cd ${ONEX_ROOT} # 后续操作都需要在 ${ONEX_ROOT} 目录下进行
+$ source manifests/env.k8s
+
+
+# 生成构建Dockerfile需要的构建产物
+$ ./scripts/installation/onex.sh onex::onex::build_artifacts
+$ save_dir=$HOME/onex-save.$(date +%F)
+$ mkdir -p ${save_dir}
+$ cp -a _output/{appconfig,cert,config} ${save_dir}
+```
+
+OneX 所有的组件都会创建在 onex 命名空间中，所以服务的名字和容器名，就没必要起名为 onex-xxx 这样的名字。同时，kakfa 容器启动时，如果发现有名为 kafka 的 kubernetes service 会 crash，所以 kafka service 名字叫 onex-kafka
+
+另外，我们最好将构建产物备份一下，这样当我们将 _output 目录清理后，仍然可以获取到访问 OneX 组件的配置和 CA 证书等文件
+
+然后创建共用的 Kubernetes 资源：
+
+```bash
+# 创建密钥。这些密钥会被挂载到 OneX 项目中各个组件中，加载使用
+$ kubectl -n onex create secret generic onex-tls --from-file=_output/cert
+# 创建 onex configmap，onex configmap 中会包含一些 OneX 组件都会用到的配置，例如：config。
+$ kubectl -n onex create configmap onex --from-file=_output/config
+```
+
+最后，配置 Linux hosts 文件:
+
+```bash
+$ sudo tee -a /etc/hosts <<'EOF'
+
+
+# host configs for onex project
+127.0.0.1 onex.usercenter.superproj.com
+127.0.0.1 onex.gateway.superproj.com
+127.0.0.1 onex.apiserver.superproj.com
+127.0.0.1 onex.controllermanager.superproj.com
+127.0.0.1 onex.nightwatch.superproj.com
+127.0.0.1 onex.miner.superproj.com
+127.0.0.1 onex.minerset.superproj.com
+127.0.0.1 onex.toyblc.superproj.com
+127.0.0.1 onex.fakeserver.superproj.com
+127.0.0.1 onex.cacheserver.superproj.com
+EOF
+```
+
+如果上述域名已经配置过，可以不用再配置
+
+##### 构建 OneX 组件
+
+接下来，我们还需要构建 OneX 镜像，并将镜像导入到 Kind 集群中，命令如下：
+
+```bash
+# OneX 项目仓库中，包含了创建 OneX 组件需要的 Kubernetes 资源定义文件，文件中使用的镜像 Tag 是 v0.1.0
+# 所以，这里我们要指定镜像 Tag 为 v0.1.0
+$ mksuger.sh -i --load -v v0.1.0
+```
+
+上面，我使用了一个封装的脚本，来创建 OneX 组件镜像，并将镜像导入到 OneX 集群节点中。如果你想构建某个组件的镜像，并导入到 OneX 集群节点中，你可以执行以下命令：
+
+```bash
+# 1. 先构建 onex-usercenter 镜像
+$ make image IMAGES=onex-usercenter VERSION=v0.1.0
+# 2. 将镜像导入到集群节点中
+$ kind load docker-image -n onex ccr.ccs.tencentyun.com/superproj/onex-usercenter-amd64:v0.1.0
+```
+
+kind load docker-image 提供的其他有用参数为：
+
+- -n, --name string：集群上下文名称（默认为 kind）
+- –nodes strings：要加载镜像的节点的逗号分隔列表，默认为所有 Node，例如：
+
+```bash
+$ kind load docker-image --name onex --nodes onex-worker,onex-worker2 ccr.ccs.tencentyun.com/superproj/onex-usercenter-amd64:v0.1.0
+```
+
+##### 安装 OneX 各组件
+
+上面我们创建了需要的部署文件，并安装了依赖的存储和中间件服务。接下来，我们就可以在 Kubernetes 集群中部署 OneX 组件。我们根据组件依赖顺序，依次部署 OneX 组件：
+
+1. onex-usercenter
+2. onex-apiserver
+3. onex-gateway
+4. onex-nightwatch
+5. onex-pump
+6. onex-toyblc
+7. onex-controller-manager
+8. onex-minerset-controller
+9. onex-miner-controller
+10. onexctl
+
+接下来我会列出每个组件的安装命令，以及测试是否部署成功
+
+1. 安装 onex-usercenter 组件
+
+```bash
+$ kubectl -n onex create configmap onex-usercenter --from-file _output/appconfig/onex-usercenter.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-usercenter
+```
+
+测试是否部署成功:
+
+```bash
+$ curl -H "Host: onex.usercenter.superproj.com" http://127.0.0.1:18080/metrics
+# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.
+# TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 2.3698e-05
+go_gc_duration_seconds{quantile="0.25"} 7.0796e-05
+go_gc_duration_seconds{quantile="0.5"} 9.9051e-05
+go_gc_duration_seconds{quantile="0.75"} 0.000146083
+go_gc_duration_seconds{quantile="1"} 0.000237999
+go_gc_duration_seconds_sum 0.001654366
+...
+```
+
+2. 安装 onex-apiserver 组件的命令如下:
+
+```bash
+$ kubectl -n onex create secret tls onex-apiserver --key ${ONEX_ROOT}/_output/cert/onex-apiserver-key.pem --cert ${ONEX_ROOT}/_output/cert/onex-apiserver.pem # onex-apiserver-https ingressroute 需要读取
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-apiserver
+```
+
+测试是否部署成功
+
+```bash
+$ mkdir -p $HOME/.onex
+$ sed 's/server: .*/server: https://onex.apiserver.superproj.com:18443/g' _output/config > $HOME/.onex/config # 用于本机访问 Kubernetes 集群中的 onex-apiserver
+$ kubectl -s https://onex.apiserver.superproj.com:18443 --kubeconfig=$HOME/.onex/config get ms:
+```
+
+为了，方便访问 zero-apiserver，这里可以将以上命令配置成 alias：
+
+```zsh
+alias kz='kubectl --kubeconfig=$HOME/.onex/config'
+```
+
+3. 安装 onex-gateway 组件的命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-gateway --from-file _output/appconfig/onex-gateway.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-gateway
+```
+
+测试是否部署成功：
+
+```bash
+$ curl -H "Host: onex.gateway.superproj.com" http://127.0.0.1:18080/metrics
+# HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.
+# TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 3.744e-05
+go_gc_duration_seconds{quantile="0.25"} 4.9097e-05
+go_gc_duration_seconds{quantile="0.5"} 6.7377e-05
+...
+```
+
+4. 安装 onex-nightwatch 组件的命令如下所示
+
+```bash
+$ kubectl -n onex create configmap onex-nightwatch --from-file _output/appconfig/onex-nightwatch.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-nightwatch
+```
+
+测试是否部署成功
+
+```bash
+$ curl -H "Host: onex.nightwatch.superproj.com" http://127.0.0.1:18080/healthz
+{"status": "ok"}
+```
+
+5. 安装 onex-pump 组件，命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-pump --from-file _output/appconfig/onex-pump.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-pump
+```
+
+测试是否部署成功：
+
+```bash
+$ curl -H "Host: onex.pump.superproj.com" http://127.0.0.1:18080/healthz
+{"status": "ok"}
+```
+
+6. 安装 onex-toyblc 组件，命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-toyblc --from-file _output/appconfig/onex-toyblc.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-toyblc
+```
+
+测试是否部署成功
+
+```bash
+$ curl -H "Host: onex.toyblc.superproj.com" -uonex:'onex(#)666' http://127.0.0.1:18080/v1/blocks
+[{"index":0,"previousHash":"0","timestamp":1465154705,"data":"genesis block","hash":"816534932c2b7154836da6afc367695e6337db8a921823784c14378abed4f7d7","address":"0x210d9eD12CEA87E33a98AA7Bcb4359eABA9e800e"}]
+```
+
+7. 安装 onex-controller-manager 组件的命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-controller-manager --from-file _output/appconfig/onex-controller-manager.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-controller-manager
+```
+
+测试是否部署成功
+
+```bash
+$ curl -H "Host: onex.controllermanager.superproj.com" -uonex:'onex(#)666' http://127.0.0.1:18080/healthz
+ok
+```
+
+8. 安装 onex-minerset-controller 组件的命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-minerset-controller --from-file _output/appconfig/onex-minerset-controller.yaml
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-minerset-controller
+```
+
+测试是否部署成功
+
+```bash
+$ curl -H "Host: onex.minerset.superproj.com" -uonex:'onex(#)666' http://127.0.0.1:18080/healthz
+ok
+```
+
+9. 安装 onex-miner-controller 组件，命令如下：
+
+```bash
+$ kubectl -n onex create configmap onex-miner-controller --from-file _output/appconfig/onex-miner-controller.yaml --from-file config.kind=$HOME/.kube/config
+$ kubectl -n onex apply -f manifests/installation/bare/onex/onex-miner-controller
+```
+
+测试是否部署成功
+
+```bash
+$ curl -H "Host: onex.miner.superproj.com" -uonex:'onex(#)666' http://127.0.0.1:18080/healthz
+ok
+```
+
+10. 安装 onexctl 组件，命令如下：
+
+```bash
+$ cp _output/appconfig/onexctl.yaml ~/.onex/
+$ _output/platforms/linux/amd64/onexctl minerset list
+NAME   REPLICAS   DISPLAYNAME   CREATED
+```
+
+如果执行 output/platforms/linux/amd64/onexctl minerset list 没有报错，说明 onexctl 安装成功。现在我们安装好了 OneX 的各个组件，一共有 10 个，数量比较多，安装后你可以再检查一下
+
+#### Kind 集群安装排障和常用操作
+
+如果在执行 kubectl exec 时报了.*scope/cgroup.procs: no such file or directory: unknown 错误，例如：
+
+```bash
+error: Internal error occurred: error executing command in container: failed to exec in container: failed to start exec "b064bbf05982c8f172986ea83a478f26fc96218b9d3b5002c56175d946692b09": OCI runtime exec failed: exec failed: unable to start container process: error adding pid 5069 to cgroups: failed to write 5069: openat2 /sys/fs/cgroup/unified/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-pod2970df92_7ac3_49c0_aaca_4871d9d2fe70.slice/cri-containerd-03f8b1c7dce06bf45fc895ff3d0cb9f66feeb3ffb8f36a0227260284392cde39.scope/cgroup.procs: no such file or directory: unknown
+```
+
+在创建集群，指定 kindest/node 镜像 TAG 时，要指定 @sha256 来指定具体的镜像版本，例如：kindest/node:v1.28.0@sha256:dad5a6238c5e41d7cac405fae3b5eda2ad1de6f1190fa8bfc64ff5bb86173213。详细可参考：[Kind Release 页面](https://github.com/kubernetes-sigs/kind/releases)的 **NOTE** 提示
+
+如果你遇到 [kubelet-check] It seems like the kubelet isn’t running or healthy. 报错，说明安装 Kind 集群失败，kube-apiserver 没有启动。主要原因可能是以下几个点：
+
+- 可能是宿主机开启了 swap
+
+- 可能是 kubelet 和 Docker 的 cgroup driver 不一致导致的
+
+- 可能是已安装的组件有 Bug，建议你优先尝试更换 Kind 的版本
+
+在使用 Kubernetes 开发的过程中，如果你要登录 Kind Node 进行一些操作、排障，可以使用以下命令：
+
+```bash
+$ docker exec -it onex-worker bash
+root@zero-worker:/# crictl img
+```
+
+如果 Kubernetes Node 容器中的镜像占用了很大的空间，你可以使用以下命令来清理：
+
+```bash
+$ docker exec -it onex-worker bash
+# ctr -n k8s.io i rm `ctr -n k8s.io i ls|awk '{print $1}'`
+# crictl img ls # 虽然仍然能够看到 dangling 镜像，但是实际上宿主机硬盘空间已经被释放
+```
