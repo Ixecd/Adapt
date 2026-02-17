@@ -6169,3 +6169,270 @@ $ kubectl create -f deployment.yaml
 **GVR（Group Version Resource）是 API 资源的组、版本和资源名称的组合**。例如，`apps/v1/deployments` 表示 `apps` 组中版本为 `v1` 的所有 `Deployment` 资源。GVR 用于在代码中动态地构建和操作 API 资源的 URL 路径
 
 这些概念在 Kubernetes 中非常重要，特别是在编写自定义控制器、操作 CRD（Custom Resource Definition）等场景下，开发人员需要理解和使用这些概念来操作和管理 Kubernetes 的 API 资源。通过 GV、GVK 和 GVR，开发人员可以准确定位和操作集群中的各种 API 资源
+
+## Kubernetes 支持哪些RESTful API接口？
+
+### Kubernetes 中支持哪些 HTTP 接口？
+
+首先，我们来看下，Kubernetes中支持哪些 HTTP 接口。一般的企业应用通常会支持以下HTTP路由：
+
+![HTTP](./images/restful_api_13.png)
+
+Kubernetes 中除了支持上述 API 接口操作之外，还支持更多的接口操作类型，如下（可参考 pod.go 文件）：
+
+![api_ops](./images/restful_api_14.png)
+
+### Kubernetes HTTP 路由生成方法
+
+Kubernetes 中 HTTP 路由的构建，其实分为客户端 HTTP 路由构建和服务端 HTTP 路由指定两种方式
+
+- **客户端 HTTP 路由构建**：指 client-go 根据 SDK 提供的接口，在最终发送 HTTP 请求时，指定 HTTP 路由
+
+- **服务端 HTTP 路由指定**：指 kube-apiserver 在服务启动时设置 HTTP 路由，类似于 r.GET 这种形式
+
+接下来，我们分别来说
+
+### 客户端 HTTP 路由构建
+
+通常通过 SDK 来访问 kube-apiserver。Kubernetes 提供 [client-go](https://github.com/kubernetes/client-go) 包拱Go开发者高效访问 kube-apiserver
+
+client-go 是由 `client-gen` 工具自动生成的。在使用 `client-gen` 生成 client-go 代码时，我们可以指定需要给资源生成的 API 操作
+
+例如，我们新增加了一个 `XXX` 资源，资源定义如下（见 `xxx_types.go` 文件）：
+
+```go
+package resourceobject
+
+import (
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// +enum
+type XXXPhase string
+
+// These are the valid phases of a xxx.
+const (
+    // XXXRunning means the xxx is in the running state.
+    XXXRunning XXXPhase = "Running"
+    // XXXPending means the xxx is in the pending state.
+    XXXPending XXXPhase = "Pending"
+)
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// XXX is an example definition of a Kubernetes resource object.
+type XXX struct {
+    metav1.TypeMeta `json:",inline"`
+    // Standard object's metadata.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    // +optional
+    metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+    // Spec defines the behavior of the XXX.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Spec XXXSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+
+    // Status describes the current status of a XXX.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Status XXXStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
+
+// XXXSpec describes the attributes on a XXX.
+type XXXSpec struct {
+    // DisplayName is the display name of the XXX resource.
+    DisplayName string `json:"displayName" protobuf:"bytes,1,opt,name=displayName"`
+
+    // Description provides a brief summary of the XXX's purpose or functionality.
+    // It helps users understand what the XXX is intended for.
+    // +optional
+    Description string `json:"description,omitempty" protobuf:"bytes,2,opt,name=description"`
+
+    // You can add more status fields as needed.
+    // +optional
+}
+
+// XXXStatus is information about the current status of a XXX.
+type XXXStatus struct {
+    // Phase is the current lifecycle phase of the xxx.
+    // +optional
+    Phase XXXPhase `json:"phase,omitempty" protobuf:"bytes,1,opt,name=phase,casttype=NamespacePhase"`
+
+    // ObservedGeneration reflects the generation of the most recently observed XXX.
+    // +optional
+    ObservedGeneration int64 `json:"observedGeneration,omitempty" protobuf:"varint,2,opt,name=observedGeneration"`
+
+    // Represents the latest available observations of a xxx's current state.
+    // +optional
+    // +patchMergeKey=type
+    // +patchStrategy=merge
+    // +listType=map
+    // +listMapKey=type
+    Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,3,rep,name=conditions"`
+
+    // You can add more status fields as needed.
+    // +optional
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// XXXList is a list of XXX objects.
+type XXXList struct {
+    metav1.TypeMeta `json:",inline"`
+    // Standard list metadata.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    // +optional
+    metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+    // Items is a list of schema objects.
+    Items []XXX `json:"items" protobuf:"bytes,2,rep,name=items"`
+}
+```
+
+我们可以执行以下 client-gen 命令来给 `XXX` 生成 SDK 方法：
+
+```bash
+$ git clone https://github.com/superproj/k8sdemo.git
+$ cd resourcedefinition/
+$ go mod tidy
+$ client-gen -v 10 --go-header-file ./boilerplate.go.txt --output-dir ./generated/clientset --output-pkg=github.com/superproj/k8sdemo/resourcedefinition/generated/clientset --clientset-name=versioned --input-base= --input $PWD/apps/v1beta1
+```
+
+上述命令会生成 `apps/v1beta1` 目录中指定资源的客户端方法，用到的命令行参数释义如下：
+
+- `-v 10`：设置日志级别，数值越高，输出的日志信息越详细
+
+- `--go-header-file ./boilerplate.go.txt`：指定一个 Go 文件头的模板（boilerplate），通常用于添加版权信息、作者信息等。这会被添加到生成的每个文件的顶部
+
+- `--output-dir ./generated/clientset`：指定生成代码的输出目录。在这个例子中，生成的客户端代码将存放在 `./generated/clientset` 目录下
+
+- `--output-pkg=github.com/superproj/k8sdemo/resourcedefinition/generated/clientset`：设置生成代码的包名称
+
+- `--clientset-name=versioned`：指定生成的客户端集的名称。此处定义的 `versioned` 客户端集将用于封装 API 资源的访问
+
+- `--input-base=`：该参数用于设置输入基础路径。如果不设置，会默认使用当前工作目录作为基础路径。一般来说，留空表示从输入路径开始
+
+- `--input $PWD/apps/v1beta1`：指定要生成客户端代码的 API 资源的目录。`$PWD/apps/v1beta1` 表示当前工作目录下的 `apps/v1beta1` 文件夹，通常这个文件夹包含了 API 的定义文件和类型定义
+
+`client-gen` 工具生成的 `XXX` 资源方法见：[generated/clientset/versioned/typed/apps/v1beta1/xxx.go](https://github.com/onexstack/kubernetes-examples/blob/master/resourcedefinition/generated/clientset/versioned/typed/apps/v1beta1/xxx.go)
+
+这里要注意，`apps/v1beta1` 目录中可能定义了很多个 Kubernetes 资源对象，`client-gen` 工具会根据资源定义之上有无 `// +genclient` 注释，来判断是否要为该资源生成 SDK 方法。如果有 `// +genclient` 则生成，没有 `// +genclient` 则不生成，例如：
+
+```go
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// XXX is an example definition of a Kubernetes resource object.
+type XXX struct {
+    metav1.TypeMeta `json:",inline"`
+    // Standard object's metadata.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    // +optional
+    metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+    // Spec defines the behavior of the XXX.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Spec XXXSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+
+    // Status describes the current status of a XXX.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Status XXXStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
+```
+
+`client-gen` 工具在生成接口方法时，默认会生成 `Create`、`Update`、`UpdateStatus`、`Delete`、`DeleteCollection`、`Get`、`List`、`Watch`、`Patch`，例如：
+
+```go
+// XXXInterface has methods to work with XXX resources.
+type XXXInterface interface {
+    Create(ctx context.Context, xXX *v1beta1.XXX, opts v1.CreateOptions) (*v1beta1.XXX, error)
+    Update(ctx context.Context, xXX *v1beta1.XXX, opts v1.UpdateOptions) (*v1beta1.XXX, error)
+    UpdateStatus(ctx context.Context, xXX *v1beta1.XXX, opts v1.UpdateOptions) (*v1beta1.XXX, error)
+    Delete(ctx context.Context, name string, opts v1.DeleteOptions) error
+    DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error
+    Get(ctx context.Context, name string, opts v1.GetOptions) (*v1beta1.XXX, error)
+    List(ctx context.Context, opts v1.ListOptions) (*v1beta1.XXXList, error)
+    Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error)
+    Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *v1beta1.XXX, err error)
+    XXXExpansion
+}
+```
+
+我们可以通过 `// +genclient:method=...` 注释指定要生成的 API 接口方法、对应的 HTTP 方法、入参和回参等。例如，OneX 项目中 `MinerSet` 资源定义文件 [minerset_types.go](https://github.com/superproj/onex/blob/v0.1.1/pkg/apis/apps/v1beta1/minerset_types.go#L25)：
+
+```go
+
+// +genclient
+// +genclient:method=GetScale,verb=get,subresource=scale,result=k8s.io/api/autoscaling/v1.Scale
+// +genclient:method=UpdateScale,verb=update,subresource=scale,input=k8s.io/api/autoscaling/v1.Scale,result=k8s.io/api/autoscaling/v1.Scale
+// +genclient:method=ApplyScale,verb=apply,subresource=scale,input=k8s.io/api/autoscaling/v1.Scale,result=k8s.io/api/autoscaling/v1.Scale
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// MinerSet ensures that a specified number of miners replicas are running at any given time.
+type MinerSet struct {
+    metav1.TypeMeta `json:",inline"`
+
+    // If the Labels of a MinerSet are empty, they are defaulted to
+    // be the same as the Miner(s) that the MinerSet manages.
+    // Standard object's metadata.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    // +optional
+    metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+    // Spec defines the specification of the desired behavior of the MinerSet.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Spec MinerSetSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+
+    // Status is the most recently observed status of the MinerSet.
+    // This data may be out of date by some window of time.
+    // Populated by the system.
+    // Read-only.
+    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    // +optional
+    Status MinerSetStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
+```
+
+`+genclient:method=GetScale,verb=get,subresource=scale,result=k8s.io/api/autoscaling/v1.Scale` 注释释义如下：
+
+- `method`: 指定要生成的方法名称
+
+- `verb`: HTTP 动词，用于指定该方法的行为，如 get、update
+
+- `subresource`: 指定这个方法是针对子资源的操作，通常用于扩展资源的 API，如缩放
+
+- `input`: 指定该方法的输入类型
+
+- `result`: 指定该方法的返回类型
+
+### 服务端 HTTP 路由指定
+
+服务端的 HTTP 路由是由 kube-apiserver 在启动时，用静态代码的方式添加的。添加方法你可以查看 [registerResourceHandlers](https://github.com/kubernetes/apiserver/blob/v0.30.4/pkg/endpoints/installer.go#L523) 方法，添加 HTTP 路由的核心逻辑代码如下：
+
+```go
+        // Handler for standard REST verbs (GET, PUT, POST and DELETE).
+        // Add actions at the resource path: /api/apiVersion/resource
+        actions = appendIf(actions, action{"LIST", resourcePath, resourceParams, namer, false}, isLister)
+        actions = appendIf(actions, action{"POST", resourcePath, resourceParams, namer, false}, isCreater)
+        actions = appendIf(actions, action{"DELETECOLLECTION", resourcePath, resourceParams, namer, false}, isCollectionDeleter)
+        // DEPRECATED in 1.11
+        actions = appendIf(actions, action{"WATCHLIST", "watch/" + resourcePath, resourceParams, namer, false}, allowWatchList)
+    
+        // Add actions at the item path: /api/apiVersion/resource/{name}
+        actions = appendIf(actions, action{"GET", itemPath, nameParams, namer, false}, isGetter)
+        if getSubpath {
+            actions = appendIf(actions, action{"GET", itemPath + "/{path:*}", proxyParams, namer, false}, isGetter)
+        }
+        actions = appendIf(actions, action{"PUT", itemPath, nameParams, namer, false}, isUpdater)
+        actions = appendIf(actions, action{"PATCH", itemPath, nameParams, namer, false}, isPatcher)
+        actions = appendIf(actions, action{"DELETE", itemPath, nameParams, namer, false}, isGracefulDeleter)
+        // DEPRECATED in 1.11
+        actions = appendIf(actions, action{"WATCH", "watch/" + itemPath, nameParams, namer, false}, isWatcher)
+        actions = appendIf(actions, action{"CONNECT", itemPath, nameParams, namer, false}, isConnecter)
+        actions = appendIf(actions, action{"CONNECT", itemPath + "/{path:*}", proxyParams, namer, false}, isConnecter && connectSubpath)
+```
