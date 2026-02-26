@@ -16800,4 +16800,692 @@ $ _output/bin/kube-proxy --v=10 --config=kube-proxy.yaml  --master="https://192.
 
 此外，OneX 项目也借鉴了 Kubernetes 的组件配置机制，例如，[onex-minerset-controller](https://github.com/superproj/onex/blob/v0.1.1/internal/controller/minerset/apis/config/v1beta1/types.go#L25) 组件通过 `MinerSetControllerConfiguration` 来进行配置。具体实现见 OneX 项目根目录下的 [internal/controller/minerset/apis/config](https://github.com/superproj/onex/tree/master/internal/controller/minerset/apis/config) 目录
 
+## Feature Gates: Kubernetes中的Feature Gates设计
 
+在 Go 项目开发中，我们通常使用配置文件或者命令行选项来控制是否开启某个功能，这个功能可能是新加入的实验性质的功能，也可能是已经稳定的功能。总之，我们需要一种机制，来让应用进程内感知到是否开启此功能，或者此功能的配置是什么
+
+为此，Kubernetes 提供了一种灵活、强大的重要机制——Feature Gates（功能门控）
+
+### 什么是 Feature Gates？
+
+功能门控是 Kubernetes 中用于控制特性启用与否的一种机制。它允许开发者在集群中逐步引入新特性，便于测试和验证，同时也为用户提供了选择是否启用某些功能的灵活性。功能门控通常用于实验性特性或尚未完全稳定的功能。通过功能门控，开发者可以在不影响整个系统的情况下，逐步推出新特性
+
+几乎所有的软件都有漏洞，而且新软件往往比成熟的软件有更多、更严重的漏洞。**Feature Gates 旨在快速停止一个新功能，并减轻漏洞带来的损害**。新功能的作者和审阅者，应该花点时间思考下，Feature Gates 是否达到了这一目标
+
+这里需要注意，**Feature Gates 并不会作为长期控制开启 / 禁用某个功能的手段**。通常情况下，Feature Gates 所管控的功能在 GA 或者被弃用后，都会从 Feature Gates 中被[废弃](https://kubernetes.io/docs/reference/using-api/deprecation-policy)或移除。如果新功能经过验证，决定加入 Kubernetes 长期存在，那么功能的开启 / 禁用方式应该从 Feature Gates 中移除，并用其他更加适配的方式来管控，例如：配置文件、命令行选项等
+
+Feature Gates 中包含 2 类信息和含义：
+
+- Feature：功能
+
+- Gates：门控，用来控制是否开启功能
+
+所以，Kubernetes 中 Feature Gate 功能其实就是用来配置某个功能是否开启的。而且这个功能，通常具有试验性质，稳定后会从 Feature Gates 中被移除，并作为稳定的功能添加到 Kubernetes API 中或者主干代码中
+
+注意：本课程从较高的维度来介绍 Feature Gates。如果你想了解更多的细节、代码片段等，请参考 [api_changes.md](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api_changes.md)。
+
+### 如何定义一个 Feature Gates？
+
+功能门控的定义包括以下结构字段（见文件 [feature_gate.go#L72](https://github.com/kubernetes/kubernetes/blob/v1.31.1/staging/src/k8s.io/component-base/featuregate/feature_gate.go#L72)）：
+
+```go
+type FeatureSpec struct {
+    // Default 是特性的默认启用状态。如果门控值没有明确设置，就会使用该值。
+  Default bool
+  
+  // LockToDefault 表示特性是否锁定为默认值且不可更改。
+  LockToDefault bool
+  
+  // PreRelease 表示特性的成熟度。可能的值有 "featuregate.Alpha"、"featuregate.Beta"、
+    // "featuregate.GA" 或 "featuregate.Deprecated"。
+  PreRelease prerelease
+
+    // Version 表示该 FeatureSpec 有效的最早版本。  
+    // 如果一个功能有多个 FeatureSpec，则使用版本号最高且小于或等于组件的有效版本的那个。
+    Version *version.Version
+}
+```
+
+除非某个 Feature Gate 经过 [Production Readiness Review](https://github.com/kubernetes/community/blob/master/sig-architecture/production-readiness.md) 文件的审查和批准，否则 Feature Gate 预期具有以下行为：
+
+- 切换功能门控不会影响其他组件。例如：在 kube-apiserver 中禁用一个 Feature Gate，不会影响在 kubelet 或 kube-scheduler 中同一个 Feature Gate 的启用 / 禁用状态，并且组件之间不需要有关联
+
+- 切换 Feature Gate 的影响应该仅限于 Feature 的范围。启用或禁用 Feature Gate 不应影响不使用该 Feature Gate 的工作负载
+
+- 切换 Feature Gate 不应导致集群中的传播效应或级联交互
+
+- 禁用 Feature Gate 应可以防止因该特性的 Bug 造成的进一步损害
+
+此外，我们还可以通过标志（见 --feature-gates）或组件配置文件（见 featureGates 配置项）启用或禁用门控，有些还可以通过环境变量启用。以及，生产环境 Kubernetes 中不支持在运行时更改 Feature Gates，通常通过重启组件来切换 Feature Gate
+
+### Feature Gates 的生命周期
+
+Feature Gates 中的功能一般会按顺序经历 `Alpha` -> `Beta` -> `GA` 3 个发布阶段。如果某个 Feature 不再被支持，可以将它们标记为 `Deprecated`。有些 Feature 也可能会跳过某个阶段，但大多数 Feature 都会经历上述 3 个阶段
+
+Feature 的版本在发布时，需要遵循以下规范：
+
+- 涉及 API 变更 的功能必须经过 Alpha、Beta、GA 阶段
+
+- 目标 Feature 未经过验证，或复杂性较高，或具有缺陷、风险、性能、扩展性等问题，应该经过 Alpha、Beta、GA 阶段
+
+- 目标 Feature 复杂度低且性能、扩展性影响不大，但仍然存在影响应用的风险，可能会跳过 Alpha，直接进入 Beta 阶段（前提是到达 Beta 的发布标准）。应该默认处在关闭状态，直到在生产环境中充分验证该功能
+
+- 在某些情况下，如果目标 Feature 可能导致之前正常的功能异常，需要默认关闭
+
+- 风险非常小的改动，如果想通过 Feature Gate 控制开启 / 禁用，可以选择跳过 Alpha，直接进入 Beta 阶段（前提是达到 Beta 的发布标准），并且从一开始就默认启用
+
+- 对于一些风险较高的 Bug 修复，也可以通过 Feature Gate 来控制是否开启，建议直接进入 Beta 阶段，并且从一开始就默认启用。对于可能被移除的 Bug 修复，可以使用 Deprecated 状态，但仍然需要确保 Bug Fix 可以被禁用
+
+接下来，我们看看每个发布阶段，Feature Gate 的参数设置
+
+首先是 Alpha 阶段
+
+- `PreRelease` 设置为`featuregate.Alpha`
+
+- `Default` 始终设置为 `false`
+
+- `LockToDefault` 设置为 false（或未指定）
+
+Alpha 功能默认不启用，但用户可以明确开启
+
+其次是 Beta 阶段
+
+- `PreRelease` 设置为 `featuregate.Beta`
+
+- `Default` 通常设置为 `true`
+
+- `LockToDefault` 设置为 `false`（或未指定）
+
+Beta 功能通常默认启用（注意 beta 功能和 beta API 不同），但用户可以选择关闭该功能
+
+在很少的情况下，虽然 Feature Gate 是 Beta 阶段，但这个功能默认会被禁用。这告诉用户，尽管这个功能是 Beta，但该功能仍然需要一些工作，来确保该功能可以默认处在开启状态。例如，`CSIMigration` 功能门控如下所示：
+
+```go
+  CSIMigration:          {Default: true,  PreRelease: featuregate.Beta},
+  CSIMigrationGCE:       {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires GCE PD CSI Driver)
+  CSIMigrationAWS:       {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires AWS EBS CSI driver)
+  CSIMigrationAzureDisk: {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires Azure Disk CSI driver)
+  CSIMigrationAzureFile: {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires Azure File CSI driver)
+  CSIMigrationvSphere:   {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires vSphere CSI driver)
+```
+
+最后是 GA 阶段
+
+- `PreRelease` 设置为 `featuregate.GA`
+
+- `Default` 始终设置为 `true`
+
+- `LockToDefault` 通常设置为 `true`
+
+GA 功能始终默认开启，并且通常不能被禁用
+
+在很少的情况下，一个 GA 功能可以被设置为禁用。这意味着，尽管这个功能处在 GA 状态，但用户需要时间来确保自己可以使用该功能。这给了用户一些开启的缓冲时间，但该功能最终仍然会被设置为 `LockToDefault=true`，并像其他功能一样退役
+
+在 GA 和弃用至少 2 次发布后，Feature Gate 应该被移除。通常我们会在代码中添加 `// remove in 1.23` 这样的注释，表示计划什么时候移除这个 Feature Gate。这样的提示可以使用户提前移除对功能门控的引用，否则在 Kubernetes 移除功能门控后，可能会导致程序出现异常
+
+当设置为 `LockToDefault=true` 时，Kubernetes 还会从代码库中删除对功能门控的引用代码
+
+最后是 Deprecation
+
+- `PreRelease` 设置为 `featuregate.Deprecated`
+
+- `Default` 设置为 `false`
+
+- 你可以查看 [Kubernetes 弃用政策](https://kubernetes.io/docs/reference/using-api/deprecation-policy/#deprecation) 以获取更多详细信息
+
+如果 Kubernetes 用户在某个 Feature Gate 被移除时受到了影响，用户可以将该 Feature Gate 设置为 `Default=true`，然后提交 Bug。此时，Kubernetes 社区会重新考虑是否需要启用该功能，并可能选择在未来 2 个版本将 `Default` 设置为 `true`，直到最终移除该 Feature Gate
+
+上面介绍了 Kubernetes 添加新功能时的功能门控参数设置，但如果是功能替换，功能门控参数又该如何设置呢？
+
+这种情况下，Kubernetes 会通过 Feature Gate 控制旧功能是否可用。在旧功能没有达到 GA 状态之前，Feature Gate 参数设置如下：`{Default: true, PreRelease: featuregate.Beta}`。
+
+同时，Kubernetes 会将新功能以非 Feature Gate 的方式添加到 Kubernetes 代码中，供用户使用。当新的功能达到 GA 状态后，并且需要弃用旧功能时，旧功能的 Feature Gate 可以设置为：`{Default: false, PreRelease: featuregate.GA, LockToDefault: true}`。例如：[LegacyNodeRoleBehavior & ServiceNodeExclusion](https://github.com/kubernetes/kubernetes/pull/97543/files)
+
+### 在代码中使用功能门控
+
+功能门控其实就是高级的 bool 变量，它们要么启用，要么禁用。但是，在实现功能门控的时候，有一些模式可供你遵循
+
+接下来，我们就看看不同功能类别下应该如何编程。我们具体讨论以下场景：
+
+![fg](./images/feature_gates_1.png)
+
+### 添加新API字段的功能
+
+所有新增 API 字段的功能，必须先从 Alpha 开始。这保证了功能进入 Beta 后（开始使用这些字段），可以回滚到之前的版本，而不丢失数据。用户在回滚到 Alpha 版本的时候，不保证回滚成功
+
+当功能门控被禁用时，系统应该表现得像这些 API 字段不存在一样。尝试使用这些 API 字段的操作，应该能够继续使用，并且新的 API 字段相关的数据需要被丢弃
+
+API 注册代码（位于 `pkg/registry/…` 目录下），需要在 Validation 之前检查门控。如果门控被禁用，并且操作时 CREATE，那么新字段必须被移除（设置为 `nil`）；如果门控被禁用并且操作时 UPDATE，那么必须检查资源对象之前的形式。只有当这个资源对象没有使用这个字段时，才可以移除新的字段。例如：
+
+```go
+if disabled(gate) && !newFieldInUse(oldObj) {
+    obj.NewField = nil
+}
+```
+
+### 验证：无默认值的字段
+
+对于没有默认值的可选字段，API validation 时不应检查门控。相反，这种情况下的常见处理模式为：如果字段有值，则必须验证该值。这确保了在启用功能门控的条件下，对象一旦通过验证并被接受，后续的门控改变不会导致已保存对象验证失败。其实也就是说，不管该功能门控是否开启，新字段有值的时候必须检查值
+
+### 验证：有默认值的字段
+
+对于有默认值的可选字段，这意味着新字段是必选字段，一旦 Feature Gate 功能达到 GA 阶段，并移除 Feature Gate，不应该存在这些字段没有值的情况
+
+这些字段的验证方法通常如下所示：
+
+```go
+if obj.NewField == nil {
+    allErrs = append(allErrs, field.Required(...))
+} else {
+    if !newFieldValid(obj.NewField, fldPath.Child("newField")) {
+        allErrs = append(allErrs, field.Invalid(...))
+    }
+}
+```
+
+当功能门控处在开启状态，Validation 时必须同时考虑功能门控的开关状态、相关的 API 操作类型及资源对象之前的状态。当功能门控被禁用时，不应该校验该功能为必须项；当功能门控被开启时，应该校验该字段必须要设置值
+
+API 注册代码（位于 `pkg/registry/…` 目录下），必须在验证之前检查门控，并传递一个标志到验证逻辑中（通常作为 Option 结构中的字段）来告诉验证代码，是否需要验证新字段，例如：
+
+```go
+if enabled(gate) || newFieldInUse(oldObj) {  
+    options.EnableNewField = true  
+}  
+ValidateThisObject(obj, oldObj, options)
+```
+
+然后验证代码看起来像这样：
+
+```go
+if opts.EnableNewField {  
+    if obj.NewField == nil {  
+        allErrs = append(allErrs, field.Required(...))  
+    } else {  
+        if !newFieldValid(obj.NewField, fldPath.Child("newField")) {  
+            allErrs = append(allErrs, field.Invalid(...))  
+        }  
+    }  
+}
+```
+
+新增 API 字段时，通常需要检查功能门控。当功能门控被禁用时，系统应该表现得像新的 API 字段不存在一样，API 字段虽然有值，但不会触发任何功能逻辑。这种实现可以确保：当新字段引入 Bug 需要关闭新功能时，能够消除新字段对系统的影响
+
+### 更改现有 API 字段的功能
+
+对于不添加新字段，但扩展了 API 中允许的值的功能（例如，向枚举中添加值或放宽验证），功能门控必须从 alpha 开始，原因与添加新字段的功能相同。如果 Feature 不改变 API 的定义，仅仅改变了 API 的操作（如允许更新以前不可变更的字段），可以直接跳过 Alpha
+
+这里我们其实也能了解到，Kubernetes 对 API 定义的变更非常慎重，因为它会直接影响到外部用户是否需要改变现有的 API 接口调用，从而影响用户的体验
+
+API 注册代码（位于 `pkg/registry/…` 目录下）必须在验证之前检查门控。与新字段的情况一样，此逻辑必须考虑字段的值、当前操作以及（在 UPDATE 的情况下）资源对象的先前状态。类似于有默认值的新字段，它必须将一个标志传递到验证逻辑中（通常作为 `Option` 结构中的字段）来指示验证代码是否应该允许新值。验证代码实现如下：
+
+```go
+if enabled(gate) || newFieldValueInUse(oldObj) {  
+    options.AllowNewFieldValue = true  
+}  
+ValidateThisObject(obj, oldObj, options)
+```
+
+这种功能的实现可能需要检查门控，也可能不需要，这取决于具体的功能。与添加新字段不同，当功能门控被禁用时，无法简单地忽略该功能的存在。功能实现必须决定在门控被禁用但功能相关的值已经被使用和存储的情况下该如何处理
+
+有些功能可以回退到类似的值，而有些则必须继续使用新值。重点应该放在风险控制上：如果功能存在 Bug，禁用门控应该能够停止或至少限制潜在的损害
+
+### 没有改变API的功能
+
+没有改变 API 的定义，但需要修改功能实现的 Feature 可能从 alpha 开始（很少从 beta 开始）。与那些改变 API 定义的功能不同，实现逻辑是应用功能门控的唯一地方。这通常表现为一个简单的 `if/else` 块：
+
+```go
+if enabled(gate) {  
+    doNewThing()  
+} else {  
+    doOldThing()  
+}
+```
+
+与基于 API 的功能一样，系统应在功能门控被禁用时表现得像功能不存在一样。鉴于功能的多样性，“表现得像功能不存在”的确切含义必须由每个功能的实现确定。重点应放在风险缓解上：如果功能有 Bug，禁用门控应该停止或至少限制损害
+
+### Feature Gates的类型
+
+在 Kubernetes 中，Feature Gates 分为 2 类
+
+首先是 **FeatureGate（不可变功能门控），可以理解为只读的 Feature Gates**，提供了3个方法，分别用来判断功能是否开启、列出所有注册的功能列表、深拷贝自身。接口定义如下：
+
+```go
+// FeatureGate indicates whether a given feature is enabled or not
+type FeatureGate interface {
+    // Enabled returns true if the key is enabled.
+    Enabled(key Feature) bool
+    // KnownFeatures returns a slice of strings describing the FeatureGate's known features.
+    KnownFeatures() []string
+    // DeepCopy returns a deep copy of the FeatureGate object, such that gates can be
+    // set on the copy without mutating the original. This is useful for validating
+    // config against potential feature gate changes before committing those changes.
+    DeepCopy() MutableFeatureGate
+}
+```
+
+其次是 **MutableFeatureGate（可变功能门控），可以理解为可读写的 Feature Gates**，除了包含 FeatureGate 接口实现之外，还添加了一些写接口，用来改变 Feature Gates 内的数据，例如：新增功能、添加 Feature Gates 命令行 Flag。接口定义如下：
+
+```go
+// MutableFeatureGate parses and stores flag gates for known features from
+// a string like feature1=true,feature2=false,...
+type MutableFeatureGate interface {
+    FeatureGate
+
+    // AddFlag adds a flag for setting global feature gates to the specified FlagSet.
+    AddFlag(fs *pflag.FlagSet)
+    // Set parses and stores flag gates for known features
+    // from a string like feature1=true,feature2=false,...
+    Set(value string) error
+    // SetFromMap stores flag gates for known features from a map[string]bool or returns an error
+    SetFromMap(m map[string]bool) error
+    // Add adds features to the featureGate.
+    Add(features map[Feature]FeatureSpec) error
+    // GetAll returns a copy of the map of known feature names to feature specs.
+    GetAll() map[Feature]FeatureSpec
+    // AddMetrics adds feature enablement metrics
+    AddMetrics()
+    // OverrideDefault sets a local override for the registered default value of a named
+    // feature. If the feature has not been previously registered (e.g. by a call to Add), has a
+    // locked default, or if the gate has already registered itself with a FlagSet, a non-nil
+    // error is returned.
+    //
+    // When two or more components consume a common feature, one component can override its
+    // default at runtime in order to adopt new defaults before or after the other
+    // components. For example, a new feature can be evaluated with a limited blast radius by
+    // overriding its default to true for a limited number of components without simultaneously
+    // changing its default for all consuming components.
+    OverrideDefault(name Feature, override bool) error
+}
+```
+
+在实际开发中，`MutableFeatureGate` 通常在应用初始化的阶段使用；`FeatureGate` 通常在应用运行阶段使用，用来判断一个功能是否开启
+
+### 定义并使用 Feature Gates
+
+我们可以通过以下 2 步来定义并使用一个新的功能门控：
+
+1. 定义功能门控
+
+2. 在代码中使用功能门控
+
+### 步骤1：定义功能门控
+
+定义功能门控，又分为以下几步：
+
+1. 添加自定义功能门控列表
+
+2. 新增功能门控
+
+3. 注册功能门控
+
+#### 1.创建自定义功能门控列表
+
+新建文件 `featuregates/feature/feature_gate.go`，内容如下：
+
+```go
+package feature
+
+import (
+    "k8s.io/component-base/featuregate"
+)
+
+var (
+    // DefaultMutableFeatureGate is a mutable version of DefaultFeatureGate.
+    // Only top-level commands/options setup and the k8s.io/component-base/featuregate/testing package should make use of this.
+    // Tests that need to modify feature gates for the duration of their test should use:
+    //   defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.<FeatureName>, <value>)()
+    DefaultMutableFeatureGate featuregate.MutableFeatureGate = featuregate.NewFeatureGate()
+
+    // DefaultFeatureGate is a shared global FeatureGate.
+    // Top-level commands/options setup that needs to modify this feature gate should use DefaultMutableFeatureGate.
+    DefaultFeatureGate featuregate.FeatureGate = DefaultMutableFeatureGate
+)
+```
+
+上述代码创建了 2 个包级别的变量：
+
+- DefaultMutableFeatureGate：可写的 Feature Gates，用来在应用启动时设置 Feature Gates。例如：读取命令行 Flag，并将 Flag 传入的 Feature Gate 的开启状态设置到 `DefaultMutableFeatureGate` 全局变量中
+
+- DefaultFeatureGate：只读的 Feature Gates，用来读取 Feature Gates 中注册的功能列表，并根据是否开启，进行功能开启 / 关闭。这里需要注意，`DefaultFeatureGate` 是 `DefaultMutableFeatureGate` 的一个子集，只暴露了读方法
+
+#### 2.新增功能门控
+
+新建文件 `featuregates/feature/feature.go`，内容如下：
+
+```go
+package feature
+
+import (
+    "k8s.io/apimachinery/pkg/util/runtime"
+    "k8s.io/component-base/featuregate"
+)
+
+// Define a new feature gate.
+const MyNewFeature featuregate.Feature = "MyNewFeature"
+
+func init() {
+    // runtime.Must(utilfeature.DefaultMutableFeatureGate.Add(defaultFeatureGates))
+    runtime.Must(DefaultMutableFeatureGate.Add(defaultFeatureGates))
+}
+
+// defaultFeatureGates consists of all known specific feature keys.
+// To add a new feature, define a key for it above and add it here.
+var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
+    // owner: @colin404
+    // Deprecated: v1.31
+    //
+    // An example feature gate.
+    MyNewFeature: {Default: false, PreRelease: featuregate.Alpha},
+}
+```
+
+`k8s.io/component-base/featuregate` 包提供了功能门控的核心实现和接口，允许开发者定义和管理功能门控
+
+在上述代码中，我们使用了 `k8s.io/component-base/featuregate` 包中定义的 `featuregate.Feature`类型作为 map 的 key，`featuregate.FeatureSpec` 类型作为 map 的 value。`featuregate.Feature` 类型的底层数据类型为 `string`
+
+此外，我们还定义并注册了一个名为 `MyNewFeature` 的功能，其设置为：默认关闭（`Default: false`）、特性的成熟度为 Alpha（`PreRelease: featuregate.Alpha`）
+
+#### 3.注册功能门控
+
+新增完一个功能门控，接下来，我们还需要将此功能门控添加到全局的可变功能门控中
+
+在 `init()` 函数中，通过 `DefaultMutableFeatureGate.Add(defaultFeatureGates)` 方法调用，将我们新增的功能门控添加到全局的可变功能门控中。`defaultFeatureGates` 是我们自定义的功能门控列表。`defaultFeatureGates` 是一个 map 类型的结构，其中 key 是功能门控名字，value 是功能门控的定义，在定义中指定了功能门控的默认值、所处的发布状态
+
+### 步骤2：在代码中使用功能门控
+
+这里，我们再来看下具体如何使用新增的功能门控。添加 `featuregates/main.go` 文件，内容如下：
+
+```go
+package main
+
+import (
+    "fmt"
+    "os"
+
+    "github.com/spf13/pflag"
+    "github.com/superproj/k8sdemo/featuregates/feature"
+)
+
+func main() {
+    // Create a new FlagSet for managing command-line flags
+    fs := pflag.NewFlagSet("feature", pflag.ExitOnError)
+
+    // Set the usage function to provide a custom help message
+    fs.Usage = func() {
+        fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+        fs.PrintDefaults()
+    }
+
+    // Define a boolean flag for displaying help
+    help := fs.BoolP("help", "h", false, "Show this help message.")
+
+    // Add the feature gates to the flag set
+    feature.DefaultMutableFeatureGate.AddFlag(fs)
+
+    // Parse the command-line flags
+    fs.Parse(os.Args[1:])
+
+    // Display help message if the help flag is set
+    if *help {
+        fs.Usage()
+        return
+    }
+
+    // Check if the MyNewFeature feature gate is enabled
+    if feature.DefaultFeatureGate.Enabled(feature.MyNewFeature) {
+        // Logic when the new feature is enabled
+        fmt.Println("Feature Gates: MyNewFeature is opened")
+    } else {
+        // Logic when the new feature is disabled
+        fmt.Println("Feature Gates: MyNewFeature is closed")
+    }
+}
+```
+
+运行上述命令，输出结果如下：
+
+```bash
+ $ go run main.go -h
+Usage of /tmp/go-build224395384/b001/exe/main:
+      --feature-gates mapStringBool   A set of key=value pairs that describe feature gates for alpha/experimental features. Options are:
+                                      AllAlpha=true|false (ALPHA - default=false)
+                                      AllBeta=true|false (BETA - default=false)
+                                      MyNewFeature=true|false (ALPHA - default=false)
+  -h, --help                          Show this help message.
+$ go run main.go  --feature-gates=MyNewFeature=false
+Feature Gates: MyNewFeature is closed
+$ go run main.go  --feature-gates=MyNewFeature=true
+Feature Gates: MyNewFeature is opened
+```
+
+可以看到，我们可以通过 `--feature-gates` 来控制某个功能是否开启，非常方便。并且在执行 `-h` 时，会输出当前注册的功能列表、开启状态及成熟度
+
+上面，介绍了如何自定义并使用 Feature Gates，以此加深你对 Feature Gates 的了解。接下来，我们看下 Kubernetes 项目是如何使用 Feature Gates 的
+
+### Kubernetes中的功能门控实现
+
+Kubernetes 中使用 Feature Gates 的方式和上述介绍的定义及使用方式大同小异，区别如下：
+
+- Kubernetes 中的 Feature Gates 列表更多。Kubernetes 支持的 Feature Gates 列表见：[pkg/features/kube_features.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/features/kube_features.go#L28)。当然，你也可以执行 `kube-apiserver -h` 查看 `--feature-gates` 命令行 Flag 的描述，描述中详细列出了 kube-apiserver 支持的 Feature Gate
+
+- `kube-apiserver --feature-gates` 描述中的 Feature Gate 列表展示的 Feature Gate 名字，通过 : 符号进一步划分了 Feature Gate 的类别，例如： `kube:APIResponseCompression=true|false (BETA - default=true)`
+
+- Kubernetes 中的 Feature Gate 在定义时，有严格的注释规范，例如：
+
+```go
+    // owner: @thockin
+    // deprecated: v1.29
+    //
+    // Enables Service.status.ingress.loadBanace to be set on
+    // services of types other than LoadBalancer.
+    AllowServiceLBStatusOnNonLB featuregate.Feature = "AllowServiceLBStatusOnNonLB"
+
+    // owner: @bswartz
+    // alpha: v1.18
+    // beta: v1.24
+    //
+    // Enables usage of any object for volume data source in PVCs
+    AnyVolumeDataSource featuregate.Feature = "AnyVolumeDataSource"
+```
+
+在 Feature Gate 定义时，通过注释说明了 Feature Gate 的功能、负责人、废弃版本、每个阶段所在的版本等信息
+
+### Kubernetes 中功能门控定义
+
+Kubernetes 中有 2 个地方定义了功能门控：
+
+- `staging/src/k8s.io/apiserver/pkg/features/kube_features.go` 定义了一些通用的功能门控，这些功能会被多个 Kubernetes 组件共同使用
+
+- `pkg/features/kube_features.go` 是组件级别的功能门控，这些功能被某个组件使用，其他组件无法使用。组件级别的功能门控，可以通过以下方式（可选的）来引用通用的功能门控：
+
+```go
+package features
+
+import (
+    apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
+    "k8s.io/apimachinery/pkg/util/runtime"
+    genericfeatures "k8s.io/apiserver/pkg/features"
+    utilfeature "k8s.io/apiserver/pkg/util/feature"
+    clientfeatures "k8s.io/client-go/features"
+    "k8s.io/component-base/featuregate"
+)
+
+
+func init() {
+    runtime.Must(utilfeature.DefaultMutableFeatureGate.Add(defaultKubernetesFeatureGates))
+    runtime.Must(utilfeature.DefaultMutableFeatureGate.AddVersioned(defaultVersionedKubernetesFeatureGates))
+
+    // Register all client-go features with kube's feature gate instance and make all client-go
+    // feature checks use kube's instance. The effect is that for kube binaries, client-go
+    // features are wired to the existing --feature-gates flag just as all other features
+    // are. Further, client-go features automatically support the existing mechanisms for
+    // feature enablement metrics and test overrides.
+    ca := &clientAdapter{utilfeature.DefaultMutableFeatureGate}
+    runtime.Must(clientfeatures.AddFeaturesToExistingFeatureGates(ca))
+    clientfeatures.ReplaceFeatureGates(ca)
+}
+
+// defaultKubernetesFeatureGates consists of all known Kubernetes-specific feature keys.
+// To add a new feature, define a key for it above and add it here. The features will be
+// available throughout Kubernetes binaries.
+//
+// Entries are separated from each other with blank lines to avoid sweeping gofmt changes
+// when adding or removing one entry.
+var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
+    ...
+    genericfeatures.AdmissionWebhookMatchConditions: {Default: true, PreRelease: featuregate.GA, LockToDefault: true}, // remove in 1.33
+
+    genericfeatures.AggregatedDiscoveryEndpoint: {Default: true, PreRelease: featuregate.GA, LockToDefault: true}, // remove in 1.33
+
+    genericfeatures.AnonymousAuthConfigurableEndpoints: {Default: false, PreRelease: featuregate.Alpha},
+    ...
+}
+```
+
+在 Kubernetes 源码中导入包时，你经常可以发现有以下包重命名方式：`genericxxx`。`generic` 关键字说明这个包中的功能是通用的，这通常也意味着存在一些组件维度的、非通用的类似功能包
+
+### Kubernetes 中功能门控注册
+
+在 `k8s.io/apiserver/pkg/util/feature` 包中，定义了全局的`DefaultMutableFeatureGate` 和 `DefaultFeatureGate` 2 个 Feature Gate。程序启动时会将预定义的 Feature Gate 注册到这 2 个全局 Feature Gates 中供程序使用。例如：在 kube-apiserver 组件启动时，通过以下代码向上述 Feature Gates 注册预定义的 Feature Gate：
+
+```go
+// 位于 cmd/kube-apiserver/app/server.go 文件中
+package app
+
+import (
+    ...
+    utilfeature "k8s.io/apiserver/pkg/util/feature"
+    ...
+    "k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+    ...
+)
+
+func init() {
+    utilruntime.Must(logsapi.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
+}
+
+...
+
+// 位于 cmd/kube-apiserver/app/options/options.go 文件中
+package options
+
+import (
+    ...
+    _ "k8s.io/kubernetes/pkg/features" // add the kubernetes feature gates
+    ...
+)
+
+// 位于 pkg/features/kube_features.go 文件中
+package features
+
+import (
+    apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
+    "k8s.io/apimachinery/pkg/util/runtime"
+    genericfeatures "k8s.io/apiserver/pkg/features"
+    utilfeature "k8s.io/apiserver/pkg/util/feature"
+    clientfeatures "k8s.io/client-go/features"
+    "k8s.io/component-base/featuregate"
+)
+
+...
+
+func init() {
+    runtime.Must(utilfeature.DefaultMutableFeatureGate.Add(defaultKubernetesFeatureGates))
+    runtime.Must(utilfeature.DefaultMutableFeatureGate.AddVersioned(defaultVersionedKubernetesFeatureGates))
+
+    // Register all client-go features with kube's feature gate instance and make all client-go
+    // feature checks use kube's instance. The effect is that for kube binaries, client-go
+    // features are wired to the existing --feature-gates flag just as all other features
+    // are. Further, client-go features automatically support the existing mechanisms for
+    // feature enablement metrics and test overrides.
+    ca := &clientAdapter{utilfeature.DefaultMutableFeatureGate}
+    runtime.Must(clientfeatures.AddFeaturesToExistingFeatureGates(ca))
+    clientfeatures.ReplaceFeatureGates(ca)
+}
+```
+
+梳理下 kube-apiserver 启动时注册 Feature Gate 的流程：
+
+1. 在 `k8s.io/kubernetes/pkg/features` 包中，定义了一些预定义的 Feature Gate，这些包在被加载时，会调用 `init()` 函数，在函数中，会将这些预定义的 Feature Gate 通过 `utilfeature.DefaultMutableFeatureGate.Add` 方法注册到 `utilfeature`（`k8s.io/apiserver/pkg/util/feature` 包别名）包的 `DefaultMutableFeatureGate` Feature Gates 中
+
+2. 在 kube-apiserver 启动时，会首先导入 `k8s.io/kubernetes/cmd/kube-apiserver/app/options` 包，在 `k8s.io/kubernetes/cmd/kube-apiserver/app/options` 包中匿名导入 `k8s.io/kubernetes/pkg/features`
+
+通过以上 2 步，将 kube-apiserver 预定义的 Feature Gate 注册到 `k8s.io/apiserver/pkg/util/feature` 包的 `DefaultMutableFeatureGate` 全局变量中。之后，便可以在 kube-apiserver 代码中，使用 `DefaultMutableFeatureGate` 中注册的 Feature Gate
+
+### Kubernetes 中功能门控使用
+
+接下来，我们看看 Kubernetes 代码中是如何使用 CSIVolumeHealth 功能门控的。具体来说，使用代码见文件 [pkg/volume/csi/csi_client.go](https://github.com/kubernetes/kubernetes/blob/master/pkg/volume/csi/csi_client.go#L626)，代码内容如下：
+
+```go
+    if utilfeature.DefaultFeatureGate.Enabled(features.CSIVolumeHealth) {
+        isSupportNodeVolumeCondition, err := c.nodeSupportsVolumeCondition(ctx)
+        if err != nil {
+            return nil, err
+        }
+
+        if isSupportNodeVolumeCondition {
+            abnormal, message := resp.VolumeCondition.GetAbnormal(), resp.VolumeCondition.GetMessage()
+            metrics.Abnormal, metrics.Message = &abnormal, &message
+        }
+    }
+```
+
+我们不难发现，使用方式其实就是调用 Feature Gate 的 `Enabled` 方法，来判断功能门控是否开启，如果开启了做什么操作，如果没有开启又做什么操作。Feature Gate 来自于 `k8s.io/apiserver/pkg/util/feature` 包中的全局变量 `DefaultMutableFeatureGate`
+
+另外，在启动 kube-apiserver 时，我们也可以动态地设置某个功能是否开启，例如：
+
+```bash
+$ _output/bin/kube-apiserver --feature-gates=CSIVolumeHealth=true
+```
+
+### Feature Gates 源码剖析
+
+Kubernetes 定义 Feature Gates、使用 Feature Gates 都是通过 `k8s.io/component-base/featuregate` 包中定义的结构体、函数、方法来实现的。接下来，我就给你详细介绍下 `k8s.io/component-base/featuregate` 包的具体实现，也即 Kubernetes Feature Gates 机制的具体实现方式
+
+Kubernetes Feature Gates 机制的核心实现位于 [staging/src/k8s.io/component-base/featuregate/feature_gate.go](https://github.com/kubernetes/kubernetes/blob/v1.31.1/staging/src/k8s.io/component-base/featuregate/feature_gate.go) 文件中
+
+`k8s.io/component-base/featuregate` 包定义了一个 `featureGate` 结构体类型，该结构体类型其实就代表一个 Feature Gates。`featureGate` 结构体定义如下:
+
+```go
+// featureGate implements FeatureGate as well as pflag.Value for flag parsing.
+type featureGate struct {
+    // Feature Gates 的名称，用来表示一个 Feature Gates.
+    featureGateName string
+
+    // Feature Gates 的处理函数映射，用于定义如何处理相关的特性逻辑，如解析和启用特性。
+    special map[Feature]func(map[Feature]VersionedSpecs, map[Feature]bool, bool, *version.Version)
+
+    // 互斥锁，用于保护对以下字段的写访问，确保线程安全。
+    lock sync.Mutex
+    // 存储已知特性及其相关定义的映射（map[Feature]FeatureSpec）。
+    known atomic.Value
+    // 存储每个特性是否被启用的映射（map[Feature]bool）。
+    enabled atomic.Value
+    // 存储解析后的原始标志值的映射（map[string]bool），保留特殊特性的初始值。
+    enabledRaw atomic.Value
+    // 在调用 AddFlag 时设置为 true，以防止后续的 Add 方法调用。
+    closed bool
+    // 存储通过 Enabled 接口查询的特性，当调用 SetEmulationVersion 时，这些特性重置。
+    queriedFeatures atomic.Value
+    // 指向当前模拟版本的指针，用于特性门控的逻辑处理。
+    emulationVersion atomic.Pointer[version.Version]
+}
+```
+
+通过 `featureGate` 结构体中包含了一些字段，分别用来完成不同的功能。`featureGate`结构体具有一些方法，这些方法完成跟功能门控相关的各类功能。核心方法列表如下：
+
+- `NewFeatureGate()`：创建并返回一个新的 `featureGate` 实例
+
+- `Set(value string) error`：设置特性的值，根据传入的字符串值解析并更新功能门控的状态
+
+- `SetFromMap(m map[string]bool) error`：根据给定的映射设置特性的启用状态。这是一个公共方法，用于根据传入的键值对更新特性
+
+- `Add(features map[Feature]FeatureSpec) error`：向功能门控添加新的特性及其规格，用于扩展功能门控的能力以支持更多特性
+
+- `SetEmulationVersion(emulationVersion version.Version) error`：设置模拟版本，以便在特性逻辑中使用。此版本会影响特性启用的逻辑
+
+- `AddFlag(fs *pflag.FlagSet)`：将功能门控的标志添加到提供的标志集，便于通过命令行配置特性
+
+- `KnownFeatures() []string`：返回所有已知特性的名称列表，提供特性的可用性信息
+
+还有一些我们没讲到的其他有用的方法，可以阅读 [staging/src/k8s.io/component-base/featuregate/feature_gate.go](https://github.com/kubernetes/kubernetes/blob/v1.31.1/staging/src/k8s.io/component-base/featuregate/feature_gate.go) 文件，学习并掌握
