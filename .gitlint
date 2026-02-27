@@ -1,3 +1,3 @@
---subject-regex=^((Merge branch.*)|((revert: )?(feat|fix|perf|style|build|refactor|test|ci|docs|chore)(\(.+\))?: [^A-Z].*[^.]$))
+--subject-regex=^((Merge (branch|pull request).*?)|((revert: )?(feat|fix|perf|style|build|refactor|test|ci|docs|chore)(\([a-zA-Z0-9-]+\))?!?: .+[^.]))$
 --subject-maxlen=120
 --body-regex=^([^\r\n]{0,120}(\r?\n|$))*$
