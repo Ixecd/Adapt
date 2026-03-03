@@ -4,7 +4,7 @@
 
 **环境**：
 - 镜像：~~PyTorch 2.8.0 + CUDA 12.8 + Python 3.12~~
-- 镜像：社区镜像 deepseek-ai/DeepSeek-R1/DeepSeek-R1:v4.0
+- 镜像：~~社区镜像 deepseek-ai/DeepSeek-R1/DeepSeek-R1:v4.0~~
 
 - GPU：RTX 5090 单卡
 
@@ -118,3 +118,37 @@ spec:
 EOF
 ```
 
+## 重开一个环境
+
+```bash
+# 1. 安装 Docker（最兼容 AutoDL 的方式）
+apt-get update && apt-get install -y docker.io
+
+# 2. 启动 Docker daemon
+service docker start || nohup dockerd > /var/log/dockerd.log 2>&1 &
+
+# 3. 等待 Docker 启动
+sleep 8
+
+# 4. 验证 Docker
+docker --version
+
+# 5. 验证 GPU（关键！）
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
+```
+
+验证 Docker
+
+```bash
+# 验证 Docker 版本
+docker --version
+
+# 验证 GPU 支持（最关键）
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
+```
+
+很多基础镜像都不支持在里面跑 dockerd😅
+
+我们直接跳过完整集群，进入最有价值的部分：
+
+**就是一堆yaml文件。**
