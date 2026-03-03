@@ -18,40 +18,60 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// VLLMServiceSpec defines the desired state of VLLMService
+// VLLMServiceSpec 定义了 vLLM 服务的期望状态
 type VLLMServiceSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// Model 指定要使用的 HuggingFace 模型 ID (例如: "facebook/opt-125m")
+	// +kubebuilder:validation:Required
+	Model string `json:"model"`
 
-	// foo is an example field of VLLMService. Edit vllmservice_types.go to remove/update
+	// Image 指定 vLLM 镜像版本
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// +kubebuilder:default:="vllm/vllm-openai:latest"
+	Image string `json:"image,omitempty"`
+
+	// Replicas 指定推理服务的副本数
+	// +optional
+	// +kubebuilder:default:=1
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Resources 定义资源配额（重点是 GPU nvidia.com/gpu）
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// MaxModelLen 指定最大序列长度，对应 vLLM 的 --max-model-len
+	// +optional
+	MaxModelLen *int32 `json:"maxModelLen,omitempty"`
+
+	// GPUOption 包含 GPU 的特殊配置，如 Tensor Parallel (TP)
+	// +optional
+	// +kubebuilder:default:=1
+	TensorParallelSize *int32 `json:"tensorParallelSize,omitempty"`
+
+	// Env 允许用户传递环境变量，比如 HF_TOKEN 或加速相关的设置
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 }
 
-// VLLMServiceStatus defines the observed state of VLLMService.
+// VLLMServiceStatus 定义了 vLLM 服务的观测状态
 type VLLMServiceStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// ReadyReplicas 当前可用的副本数
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+	// Endpoint 服务可访问的内部地址 (例如: vllm-service-example.default.svc:8000)
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
 
-	// conditions represent the current state of the VLLMService resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// Phase 当前服务的阶段 (Pending, Running, Failed)
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -60,30 +80,24 @@ type VLLMServiceStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Model",type="string",JSONPath=".spec.model"
+// +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 
-// VLLMService is the Schema for the vllmservices API
+// VLLMService 是 vLLM 操作器的 Schema
 type VLLMService struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// metadata is a standard object metadata
-	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
-
-	// spec defines the desired state of VLLMService
-	// +required
-	Spec VLLMServiceSpec `json:"spec"`
-
-	// status defines the observed state of VLLMService
-	// +optional
-	Status VLLMServiceStatus `json:"status,omitzero"`
+	Spec   VLLMServiceSpec   `json:"spec"`
+	Status VLLMServiceStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// VLLMServiceList contains a list of VLLMService
 type VLLMServiceList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []VLLMService `json:"items"`
 }
 
