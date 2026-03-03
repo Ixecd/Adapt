@@ -1,6 +1,7 @@
-go 1.24.5
+go 1.25.3
 
 use (
+	./Infra/AI/vLLM/vllm-operator
 	./Infra/etcd
 	./Languages/Golang/GORM
 	./Languages/Golang/GoMock
