@@ -33,7 +33,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	inferencev1alpha1 "github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/api/v1alpha1"
+	inferencev1alpha1 "github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 

@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	inferencev1alpha1 "github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/api/v1alpha1"
+	inferencev1alpha1 "github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/api/v1alpha1"
 )
 
 var _ = Describe("VLLMService Controller", func() {

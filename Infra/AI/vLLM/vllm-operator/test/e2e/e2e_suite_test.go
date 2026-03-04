@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/test/utils"
+	"github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/test/utils"
 )
 
 var (

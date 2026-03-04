@@ -35,8 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	inferencev1alpha1 "github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/api/v1alpha1"
-	"github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/internal/controller"
+	inferencev1alpha1 "github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/api/v1alpha1"
+	"github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 

@@ -7,7 +7,7 @@ domain: ixecd.dev
 layout:
 - go.kubebuilder.io/v4
 projectName: vllm-operator
-repo: github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator
+repo: github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: ixecd.dev
   group: inference
   kind: VLLMService
-  path: github.com/Ixecd/routine_test/infra/AI/vLLM/vllm-operator/api/v1alpha1
+  path: github.com/Ixecd/routine_test/Infra/AI/vLLM/vllm-operator/api/v1alpha1
   version: v1alpha1
 version: "3"
