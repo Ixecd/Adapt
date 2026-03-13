@@ -7,8 +7,9 @@
 建议将自己整个人格画像全塞给AI进行匹配熟悉，这样既能用来聊天又能用来干活，赢麻了
 
 
+能看的出来，它是真的想让我赶紧懂😤
 
-
+![understanding](./images/understanding.png)
 
 ## AI Infra
 
