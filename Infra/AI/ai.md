@@ -9,7 +9,9 @@
 
 能看的出来，它是真的想让我赶紧懂😤
 
-![understanding](./images/understanding.png)
+![understanding](./images/understanding_1.png)
+
+![understanding](./images/understanding_2.png)
 
 ## AI Infra
 
