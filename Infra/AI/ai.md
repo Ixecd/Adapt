@@ -23,6 +23,8 @@
 
 ![understanding](./images/understanding_6.png)
 
+![understanding](./images/understanding_7.png)
+
 ## AI Infra
 
 ## AutoDL RTX 5090 首次完整成功部署 vLLM
