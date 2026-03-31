@@ -4,13 +4,7 @@
 
 ![What Fuck Id I Got It?](./images/doubao_0.png)
 
-这个是刚新开了一个号的结果
-
-![New Account](./images/doubao_10.png)
-
-这个是本来那个号的结果
-
-![Old Account](./images/doubao_11.png)
+早知道Claude直接上Max了😅
 
 # 别玩了，AI这么屌，干脆本地部署个小龙虾，让它把所有机器上能干的活全干完吧，人机合体
 
