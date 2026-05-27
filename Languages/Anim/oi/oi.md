@@ -1,4 +1,4 @@
-# Anim 错误处理——oi
+# Anim 交叉拒绝——oi
 
 ## 不是 Err。是 oi。
 
