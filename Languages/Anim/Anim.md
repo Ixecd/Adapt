@@ -18,7 +18,7 @@ Anim 把多股独立流（感受语义、个人基线、设备约束、生理反
 | 四层 IR | `ir/` | FSIR → PSIR → DSIR → ESIR |
 | 双流水线 | `dual/` | 前台 1ms FPGA 硬实时 + 后台离线预交织 |
 | 宏 | `macros/` | 语法树展开 + 类型检查 + 强度生命周期 + 创伤作用域 |
-| 错误 | `error/` | oi = 挡了。不是错了 |
+| oi | `oi/` | oi = 挡了。不是错了。不挡感受。只挡不安全的交叉 |
 | 泛型 | `generic/` | FeelingTarget trait。万物皆有感受 |
 | 局部性 | `locality/` | 1ms 硬死线。Cache miss = 帧超时 |
 
@@ -27,7 +27,7 @@ Anim 把多股独立流（感受语义、个人基线、设备约束、生理反
 | | C | Rust | Anim |
 |---|---|---|---|
 | 一等操作 | 赋值 = | 借用 & | cross_over |
-| 错误 | errno | Result<T,E> + ? | oi |
+| oi | errno | Result<T,E> + ? | oi |
 | 安全 | 无 | borrow checker | cross checker |
 | 宏 | #define 文本 | macro_rules! AST | macro_rules! + 创伤作用域 |
 | 范型 | 无（void*） | trait + monomorphization | FeelingTarget + 单态化 |
