@@ -2864,6 +2864,55 @@ RG 跨接在两个输入级运放的反相端之间：
 
 收口：三运放仪表放大器 = 两个同相输入级（各进一个 P 引脚，反相端跨接 RG）+ 一个差分输出级。RG 是增益电阻，跨接在两个反相端之间，增益 = 1 + 2Rf/RG，一个电阻调整个增益。两个同相级通过 RG 联动成差分：差分放大、共模抑制、输入阻抗极高。这是生理信号差分采集的标准方案，AFE 的核心。
 
+#### 与 controller 架构的同构——元 controller 调和子 controller
+
+三运放仪表放大器和 Pivot 的 controller 架构同构。
+
+```
+三运放 ↔ Pivot controller 架构：
+   输入级 1（同相负反馈）    = 一个 kp/controller（管一路）
+   输入级 2（同相负反馈）    = 另一个 kp/controller（管另一路）
+   第三个运放（差分输出级）  = 第三个 kp 管着前两个
+```
+
+第三个不是负载均衡，是 desired state 与 status 的关系：
+
+```
+负载均衡 = 分流（把流量分到多个），是"分配"
+第三运放 = 求差（算两个输入的差），是"比较/调和"
+   第三运放输出 = G×(Va - Vb) = 两个输入之差
+   controller 调和 = 比较 desired state 与 status
+                  = 计算两者的差（偏差）
+   → 差 = 偏差
+   → 第三运放求的 Va-Vb = controller 算的偏差
+   → 元 controller 调和底下两个 controller 的状态
+   → 不是负载均衡，是"偏差计算器"
+```
+
+分层 controller 的结构：
+
+```
+底层 controller（kp）   管具体资源（管一路）
+上层 controller（元 kp） 管底层 controller
+   = 算底层的 desired 和 status 的差
+   = 调和它们
+→ 像三运放：底层两个同相级（各自放大），
+   上层差分级（调和它们的差）
+→ "一个 kp 管一群 kp" = 元 controller 调和子 controller
+→ 分形：controller 管资源，元 controller 管 controller
+```
+
+和 Feelings 的对应：
+
+```
+"偏差是区间不是数字"、"输出是偏差的函数"，
+   就是第三运放（差分级）的语义：
+   算 desired 与 status 的差，输出按差调和
+   三运放的差分级，是 controller 偏差计算的最小模型
+```
+
+收口：三运放的两个同相输入级 = 两个 kp（各自管一路），第三个运放 = 一个 kp 管着这两个 kp。但第三个不是负载均衡（分流），是 desired state 与 status 的关系：第三运放求 Va-Vb（差），正是 controller 的 reconcile 算偏差。元 controller 调和子 controller，分层 controller 结构，像差分级调和两个同相级的输出。
+
 ## 场效应管差分放大电路——MOS 与 BJT 的区别
 
 ### 结构不变：换的是管
