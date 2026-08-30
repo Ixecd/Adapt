@@ -249,6 +249,32 @@ always @* begin          // 自动列全 a,b,c，物理正确
 end
 ```
 
+**避坑：电平 + 边沿别混在一个 always 里**
+
+`@(a or posedge clk)` 语法合法，但**别写**——把"电平触发（组合）"和"边沿触发（时序）"混一个 always，综合工具会警告/乱综合：
+
+```verilog
+// 坑：混用
+always @(a or posedge clk) begin
+    q <= d;      // 触发器（边沿）
+    y = q & a;   // 组合（电平）
+end
+```
+
+**正确做法**：一个 always 只做一种逻辑，触发器 + 逻辑门拆开：
+
+```verilog
+reg q;
+wire y;
+
+always @(posedge clk)      // 触发器：只边沿敏感
+    q <= d;
+
+assign y = q & a;          // 逻辑门：assign，a 变就响应
+```
+
+**铁律**：一个 always 里**要么全电平（组合）、要么全边沿（时序）**，别混。需要"触发器 + 逻辑门"电路 → 拆成 `always @(posedge clk)` 做触发器 + `assign`/`@*` 做逻辑门，各司其职。
+
 ### 组合逻辑（电平敏感 @*）
 
 ```verilog
