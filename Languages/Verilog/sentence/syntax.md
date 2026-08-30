@@ -123,6 +123,42 @@ assign y = a | b;   // 或门
 assign y = a ^ b;   // 异或
 ```
 
+### 显式连续赋值（先声明 wire 再 assign）
+
+先 `wire` 声明线网，再单独 `assign` 赋值。**显式 wire 的用武之地是"内部信号"**——端口（input/output）默认就是 wire，不用重复声明。
+
+```verilog
+module example_assignment (
+    input  [3:0] a, b,      // 端口：外部输入（默认 wire，不用再声明）
+    output [3:0] c, y       // 端口：外部输出
+);
+
+wire [3:0] m, n;            // 内部信号，必须显式 wire ← 显式的核心
+
+assign y = m | n;           // 显式连续赋值
+assign #(3, 2, 4) c = a & b; // 显式 + 延时赋值
+
+endmodule
+```
+
+**常见错误**：端口列表和 input/output 声明不一致（m,n 悬空）、`input`/`wire` 拼错（`inpui`/`wirc`）、`[3;0]` 分号写成冒号。
+
+### 延时赋值 #(rise, fall, turnoff)
+
+```verilog
+assign #(3, 2, 4) c = a & b;
+```
+
+三个数含义（**仿真用**，综合时忽略）：
+```
+#(rise, fall, turnoff)
+    ↑3     ↑2     ↑4
+ 上升延时  下降延时  高阻延时(只有三态输出才有意义)
+```
+
+- c 从 0→1 延迟 3 个时间单位，1→0 延迟 2 个
+- 建模门传播延迟（仿真看时序），综合不认精确门延时
+
 ## always 块
 
 `always` 是最核心的块，分组合（电平敏感）和时序（边沿敏感）两种。
