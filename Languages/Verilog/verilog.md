@@ -13,7 +13,7 @@ concurrency/     并行与跨时钟域：CDC/亚稳态/异步FIFO（最易翻车
 io/              接口协议：UART/SPI/I2C/按键消抖
 framework/       仿真与工具链：testbench/综合约束/开源流程/脚本化
 advanced/        高级主题：PLL/BRAM/原语/高速接口/优化
-others/          选型与认知：FPGA vs MCU、系统设计地基、脑机演进
+others/          核心概念：可综合、选型与认知（FPGA vs MCU）、脑机演进
 ```
 
 关键认知（对应各 md）：
