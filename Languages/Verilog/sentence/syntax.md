@@ -193,6 +193,46 @@ Verilog assign: 顺序无关，都是"持续接线"，结果一样
 
 `always` 是最核心的块，分组合（电平敏感）和时序（边沿敏感）两种。
 
+### 语法格式与敏感事件列表
+
+```verilog
+always @(敏感事件列表)
+    语句;                     // 单条语句不用 begin-end
+
+always @(敏感事件列表) begin
+    多条语句;                 // 多条必须 begin-end 包起来
+end
+```
+
+**敏感事件列表的类型**：
+```verilog
+// 单个信号（电平敏感，组合逻辑）
+always @(a)                  // a 变化就触发
+always @*                    // 所有输入变化都触发（最常用，自动包含）
+
+// 多信号
+always @(a or b)             // a 或 b 变化都触发
+always @(a, b)               // 逗号写法等价
+always @*                    // 等价"所有用到的信号"
+
+// 边沿（时序逻辑）
+always @(posedge clk)        // 时钟上升沿
+always @(negedge clk)        // 时钟下降沿
+
+// 混合（时钟 + 异步复位，常用）
+always @(posedge clk or negedge rst_n)   // 异步复位低有效
+always @(posedge clk or posedge rst)     // 异步复位高有效
+```
+
+**电平敏感 vs 边沿敏感决定电路类型**：
+```
+@(a) 或 @*           → 组合逻辑（a 变就响应，无记忆）
+@(posedge clk)       → 时序逻辑（触发器，只在上升沿锁存）
+@(posedge clk or negedge rst_n) → 时序 + 异步复位
+```
+
+**易错点**：`@*` 自动包含"块内所有用到的信号"，不用手动列——列漏一个信号 = 仿真不更新（经典 bug：`@(a)` 漏掉 b）。
+
 ### 组合逻辑（电平敏感 @*）
 
 ```verilog
