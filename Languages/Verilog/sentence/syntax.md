@@ -767,3 +767,39 @@ or #or_delay U3(co, w2, w3);
 - `#or_delay` **不是模块名**，是"给这个门设的延迟属性"（就是个数字）
 - `halfadder` 是你自定义的模块，`or` 是语言内置的门——两类不同，调用语法相同
 - `#延时` 仿真才生效，综合时忽略（真实门延迟由物理决定）
+
+### 内置基本元件：26 个（14 门级 + 12 开关级）
+
+Verilog 语言内置 26 个基本元件（gate primitive / switch primitive），不用定义直接用。
+
+**14 个门级元件**：
+```
+基本门（8）：
+  and / or / nand / nor / xor / xnor   6 个多输入门
+  not / buf                              2 个单输入缓冲/反相
+三态门（4）：
+  bufif0 / bufif1   高电平/低电平使能的缓冲（三态，含控制端）
+  notif0 / notif1   高电平/低电平使能的反相（三态）
+上拉/下拉（2）：
+  pullup / pulldown   上拉/下拉电阻（把节点拉到高/低）
+```
+
+**12 个开关级元件（MOS 开关，晶体管级）**：
+```
+无控制开关（4）：
+  tran / tranif0 / tranif1 / rtran    双向传输门
+  rtranif0 / rtranif1                 电阻型传输门（带控制）
+MOS 开关（4）：
+  nmos / pmos / cmos / rnmos / rpmos / rcmos    NMOS/PMOS/CMOS 开关
+```
+（开关级 = 晶体管层建模，仿真/模拟用，综合一般不用）
+
+**使用**：
+```verilog
+and g1(y, a, b);          // 与门
+bufif1 g2(bus, data, en); // 三态缓冲：en=1 时 data→bus，否则高阻
+pullup g3(pin);           // 上拉电阻：pin 默认拉高
+nmos g4(out, in, ctrl);   // NMOS 开关：ctrl=1 导通
+```
+
+**一句话**：Verilog 内置 26 个基本元件——**14 个门级**（基本门 and/or/not 等 + 三态门 bufif/notif + 上拉/下拉 pullup/pulldown）+ **12 个开关级**（双向传输门 tran 系列 + MOS 开关 nmos/pmos/cmos）。门级可综合常用，开关级是晶体管层建模（仿真/模拟用）。
