@@ -10,6 +10,37 @@
 - 时序验证：等时钟沿采样，别和 DUT 抢沿
 ```
 
+### 强制赋值：assign/deassign 与 force/release（仿真调试用）
+
+两对"过程强制赋值"，成对使用，**基本不可综合，只在 testbench 用**：
+
+```verilog
+// assign / deassign：给 reg/net 持续赋值，直到撤销
+initial begin
+    assign q = 1'b0;    // 持续强制 q=0（覆盖其他驱动）
+    #10;
+    deassign q;         // 撤销，恢复原来驱动
+end
+
+// force / release：更霸道，能覆盖 assign，直到释放
+initial begin
+    force q = 1'b1;     // 强制 q=1（net/reg 都能强制）
+    #10;
+    release q;          // 释放，恢复原驱动
+end
+```
+
+```
+           assign/deassign          force/release
+作用对象    reg 或 net               net 或 reg
+优先级      低于 force               高于 assign（force 覆盖 assign）
+撤销       deassign                 release
+用途       testbench 建模            testbench 调试/强制
+```
+
+- **优先级链**：`force`（最高）> 过程 `assign` > 普通赋值 > 默认驱动
+- **坑**：过程 `assign`（写在 initial/always 里）和模块级 `assign`（组合逻辑，可综合）**同名但完全不同**——前者仿真强制、后者可综合组合逻辑，别混
+
 ### 综合与约束
 ```
 - 时序约束（.sdc / .cst）：告诉工具时钟频率、IO 引脚
