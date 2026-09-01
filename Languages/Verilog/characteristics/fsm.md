@@ -163,6 +163,29 @@ assign Z = Q1 & Q0 & X;
 
 ### pre_state：可回溯的状态机（类比双向链表）
 
+### 避坑：次态计算里不要写 `next_state = x`
+
+```verilog
+// 错：next_state 设成 x（未知态）
+always @(current_state) begin
+    next_state = x;    // ← x 是"未知"不是"占位"！污染后续
+    case (current_state) ...
+end
+
+// 对：默认"保持当前状态"，不是 x
+always @* begin
+    next_state = current_state;   // 默认：保持（用 current_state，不是 x）
+    case (current_state)
+        IDLE: if (start) next_state = WORK;
+        default: next_state = IDLE;   // 非法状态防御
+    endcase
+end
+```
+
+- `x` 是"未知"不是"默认值"：仿真 x 会传染（没被 case 命中的状态变 x → 状态机跑飞），综合可能不确定
+- **组合 always 的默认值永远用"保持当前状态"（current_state），绝不用 x**
+- 这就是"段2 里 next_state = state 作为默认值"的标准写法
+
 ```verilog
 reg [1:0] pre_state;    // 前一个状态（类似链表的 prev）
 reg [1:0] state;        // 当前状态
