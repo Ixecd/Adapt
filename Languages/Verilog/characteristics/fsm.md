@@ -64,6 +64,18 @@ endmodule
 - 段2 里 `next_state = state;` 作为默认值（保持原状态），case 里只写转移条件，避免漏写产生锁存器
 - 三段式的优点：状态和输出分离，好维护、好调试（类似软件里"状态机类"分离状态与行为）
 
+### 为什么 Verilog 是多 case，不是软件的一个 switch
+
+```
+软件（Pivot）：一个 switch(state) 全写完（串行，函数内部耦合）
+Verilog 三段式：多个独立 case，各放不同 always（并行，解耦）
+  always @* case(state) next_state = ...;   // 状态转换 case（算下一步去哪）
+  always @* case(state) output = ...;        // 输出 case（算现在输出啥，独立！）
+→ 两个 case 同时跑（并行），改输出不影响次态
+```
+
+**核心原因**：硬件天然并行 → 多个 case 同时执行、互不干扰 → 能把"次态/输出"拆成独立 case。这就是三段式比一段式好的根本原因：**并行让你能拆，拆了各段独立演进**。同一套状态机逻辑，软件（串行）被迫单 switch 耦合，硬件（并行）天然多 case 解耦。
+
 ### 二段式 / 一段式
 
 ```verilog
