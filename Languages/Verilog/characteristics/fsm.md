@@ -161,6 +161,28 @@ assign Z = Q1 & Q0 & X;
 
 **和 DP 同构（带时钟的 DP）**：状态方程 = 递推（每个沿迭代一次），Q1/Q0 是记忆、X 是当前输入，跟 `dp[i]=f(dp[i-1],x[i])` 同构。
 
+### pre_state：可回溯的状态机（类比双向链表）
+
+```verilog
+reg [1:0] pre_state;    // 前一个状态（类似链表的 prev）
+reg [1:0] state;        // 当前状态
+reg [1:0] next_state;   // 次态（类似链表的 next）
+
+always @(posedge clk) begin
+    pre_state <= state;       // 记住上一个
+    state <= next_state;      // 进入次态
+end
+```
+
+**pre_state 的用途**：
+- **回溯**：状态异常时知道"从哪来的"，可回滚恢复（安全）
+- **上下文**：行为依赖"怎么走到这"（= 分支预测的"分支间相关性"，Yeh & Patt）
+- **审计**：状态切换历史（Pivot 的 `Transition{From,To,Reason}` 就是它，记录 from→to→为什么）
+
+**和双向链表的区别**：链表 prev/next 是**固定结构**（连接不变），状态机是**动态转移**（next 由条件决定）。类比帮理解"有前有后"，但状态机的 next 是"条件决定"不是"结构固定"。
+
+**一句话**：`current_state/next_state` 像双向链表的 `prev/next`——加个 `pre_state` 让状态机**可回溯**（异常回滚、上下文判断、审计日志），对安全/审计类系统（Pivot、Feelings 熔断）特别有价值。
+
 ## 状态机 vs 软件状态模式
 
 ```
