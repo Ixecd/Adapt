@@ -7,7 +7,7 @@
 ```
 sentence/        语法基础：module/端口/数据类型/assign/always/阻塞非阻塞/参数实例化
 data/            信号态：0/1/x/z、上拉下拉电阻、逻辑电平阈值
-characteristics/ 核心特性：状态机 FSM、触发器串联（RTL 本质）、低电平有效、仿真打印三兄弟
+characteristics/ 核心特性：状态机 FSM、触发器串联（RTL 本质）、低电平有效、仿真打印、门控时钟与数据对齐
 function/        常用模块：计数器/分频/流水线/移位寄存器
 concurrency/     并行与跨时钟域：CDC/亚稳态/异步FIFO（最易翻车）
 io/              接口协议：UART/SPI/I2C/按键消抖
