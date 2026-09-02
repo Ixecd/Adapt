@@ -803,3 +803,27 @@ nmos g4(out, in, ctrl);   // NMOS 开关：ctrl=1 导通
 ```
 
 **一句话**：Verilog 内置 26 个基本元件——**14 个门级**（基本门 and/or/not 等 + 三态门 bufif/notif + 上拉/下拉 pullup/pulldown）+ **12 个开关级**（双向传输门 tran 系列 + MOS 开关 nmos/pmos/cmos）。门级可综合常用，开关级是晶体管层建模（仿真/模拟用）。
+
+## 编译预处理指令（` 开头，编译期，不是仿真）
+
+```
+`define NAME value     // 定义宏（像 C 的 #define），`NAME 使用
+`undef NAME            // 取消宏
+`include "file.v"      // 包含文件（像 C 的 #include）
+`timescale 1ns/1ps     // 时间单位/精度（仿真时间刻度）
+`ifdef NAME ... `else ... `endif   // 条件编译（像 C 的 #ifdef）
+`default_nettype none  // 默认线网类型（none = 强制声明，防隐式 wire）
+`resetall              // 重置所有编译指令
+`celldefine / `endcelldefine        // 标记"这是库单元定义"（库建模用）
+`unconnect_drive       // 悬空输入驱动（仿真建模）
+`nounconnected_drive   // 取消悬空驱动
+```
+
+**常用的**：
+- `` `define ``：宏定义（条件编译开关、常量）
+- `` `timescale ``：每个文件开头设时间单位（`1ns/1ps`）
+- `` `ifdef/else/endif ``：条件编译（不同平台/仿真工具选不同代码）
+- `` `default_nettype none ``：强制显式声明（防拼错 wire 名变隐式线网）
+- 其他（`resetall`/`celldefine`/`unconnect_drive`）：库建模/仿真细节，少用
+
+**一句话**：`` ` `` 开头的是**编译预处理指令**（编译期生效，不是仿真）——常用 `define`/`timescale`/`ifdef`/`default_nettype`，其余了解即可。

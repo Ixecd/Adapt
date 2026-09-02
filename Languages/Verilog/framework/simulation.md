@@ -83,6 +83,19 @@ endspecify
 - 用途：仿真（建模引脚延迟）+ **时序分析**（综合后工具用 specify 做时序检查）——比普通 #delay 多一层
 - **RTL 设计者少碰**：库建模/门级仿真/时序工程师才写 specify，你 assign/always 不用
 
+### 时序检查：$setup / $hold（仿真验证，和 specify 配套）
+
+```verilog
+$setup(data, clk, 1.0);   // 检查：data 必须在 clk 到来前 1.0 时间就稳定（建立时间）
+$hold(data, clk, 0.5);    // 检查：data 必须在 clk 到来后保持 0.5 时间（保持时间）
+```
+
+- **$setup**：验证建立时间——data 在时钟沿前"提前稳定"够不够
+- **$hold**：验证保持时间——data 在时钟沿后"保持"够不够
+- 用途：仿真检查时序约束是否满足（data 变化离时钟沿太近 → 报时序违例）
+- 常在 specify 里声明（`$setup(data, posedge clk, 1.0);`）
+- 和四种延迟/specify 同类：仿真/时序验证用，RTL 设计少碰（库建模/时序工程师）
+
 ### 强制赋值：assign/deassign 与 force/release（仿真调试用）
 
 两对"过程强制赋值"，成对使用，**基本不可综合，只在 testbench 用**：
