@@ -10,3 +10,7 @@ data.etcd/
 *.log
 
 .vscode/
+
+# Verilog 仿真生成文件
+*.vcd
+*.vvp
